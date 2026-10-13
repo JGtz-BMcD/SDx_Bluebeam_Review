@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.1.0
+// @version      1.1.3
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -18,7 +18,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.1.0";
+    const VERSION = "1.1.3";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -404,6 +404,15 @@
         for (const e of Array.from(doomed).sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + out.slice(e.end);
         return { xml: out, removed: doomed.size, imports, latest };
     }
+    // Repair for layers saved by v1.0.x: pasted screenshots were written as <square IT="SquareImage">
+    // with no image data, which crashes the SDx/WebViewer markup loader for the whole document.
+    function stripBrokenImages(xml) {
+        const els = scanTopLevelAnnots(xml);
+        const bad = els.filter(e => String(e.attrs.IT || "") === "SquareImage" && !/<imagedata[\s>]/i.test(xml.slice(e.start, e.end)));
+        let out = xml;
+        for (const e of bad.sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + out.slice(e.end);
+        return { xml: out, removed: bad.length };
+    }
     // Groups skipped/failed items so the user can see which pages and comment types did not come in.
     function summarizeSkipped(skipped) {
         const groups = new Map();
@@ -588,18 +597,28 @@
         }
         return n;
     }
+    // Keeps each embedded image small (<= ~1.2 MB as a data URL) so the layer stays loadable in SDx.
     function canvasToPng(canvas) {
-        let url = canvas.toDataURL("image/png");
-        if (url.length > 6 * 1024 * 1024) {
-            const small = document.createElement("canvas");
-            small.width = Math.round(canvas.width * 0.6);
-            small.height = Math.round(canvas.height * 0.6);
-            const c = small.getContext("2d");
-            c.fillStyle = "#fff"; c.fillRect(0, 0, small.width, small.height);
-            c.drawImage(canvas, 0, 0, small.width, small.height);
-            url = small.toDataURL("image/png");
+        const LIMIT = 1.2 * 1024 * 1024;
+        let src = canvas, scale = Math.min(1, 1600 / Math.max(canvas.width, canvas.height));
+        for (let i = 0; i < 8; i++) {
+            let c = src;
+            if (scale < 1) {
+                c = document.createElement("canvas");
+                c.width = Math.max(1, Math.round(canvas.width * scale));
+                c.height = Math.max(1, Math.round(canvas.height * scale));
+                const x = c.getContext("2d");
+                x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+                x.drawImage(canvas, 0, 0, c.width, c.height);
+            }
+            const url = c.toDataURL("image/png");
+            if (url.length <= LIMIT) return url;
+            scale = (scale || 1) * 0.75;
         }
-        return url;
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(canvas.width * scale)); c.height = Math.max(1, Math.round(canvas.height * scale));
+        c.getContext("2d").drawImage(canvas, 0, 0, c.width, c.height);
+        return c.toDataURL("image/png");
     }
 
     // Method A: draw the stamp's own appearance stream (includes any markups that
@@ -1343,6 +1362,89 @@
         await api("/SDA/SaveMarkup", { method: "POST", body: { MarkupOBID: layerId, MarkupContent: r.xml, ...state.saveTemplate } });
         return { removed: r.removed };
     }
+    // Scans every markup layer on the open document (yours and other people's) and removes broken image markups.
+    async function repairLayers() {
+        await loadLayers();
+        const all = [...state.layers.map(l => ({ id: l.id, name: l.name })), ...state.otherLayers.map(l => ({ id: l.id, name: l.name + (l.owner ? " (" + l.owner + ")" : "") }))];
+        const report = [];
+        for (const l of all) {
+            try {
+                const cur = await api("/SDA/GetMarkupContent", { method: "POST", body: { MarkupOBID: l.id } });
+                const xml = typeof cur === "object" ? cur.value : String(cur || "");
+                const r = stripBrokenImages(xml);
+                if (!r.removed) { report.push(`${l.name}: OK`); continue; }
+                await api("/SDA/SaveMarkup", { method: "POST", body: { MarkupOBID: l.id, MarkupContent: r.xml, ...state.saveTemplate } });
+                report.push(`${l.name}: removed ${r.removed} broken image markup(s)`);
+            } catch (e) {
+                report.push(`${l.name}: FAILED (${e && e.message ? e.message : e})`);
+            }
+        }
+        return report;
+    }
+    async function onRepair() {
+        if (state.busy) return;
+        state.busy = true;
+        try {
+            setStatus("Scanning layers...");
+            const report = await repairLayers();
+            alert("Layer repair finished:\n\n" + report.join("\n") + "\n\nThe page will reload.");
+            location.reload();
+        } catch (e) {
+            setStatus("Repair failed: " + (e && e.message ? e.message : e), true);
+        } finally { state.busy = false; }
+    }
+    async function allDocLayers() {
+        await loadLayers();
+        return [...state.layers.map(l => ({ id: l.id, name: l.name, owner: l.owner })), ...state.otherLayers.map(l => ({ id: l.id, name: l.name, owner: l.owner }))];
+    }
+    // Downloads the raw XFDF of every layer on the document (base64 images shortened) for troubleshooting.
+    async function onDumpLayers() {
+        if (state.busy) return;
+        state.busy = true;
+        try {
+            setStatus("Reading all layers...");
+            const layers = await allDocLayers();
+            let out = `SDx Bluebeam Review ${VERSION} layer dump, ${new Date().toISOString()}\nDocument ${state.fileOBID}\n\n`;
+            for (const l of layers) {
+                let xml = "";
+                try {
+                    const cur = await api("/SDA/GetMarkupContent", { method: "POST", body: { MarkupOBID: l.id } });
+                    xml = typeof cur === "object" ? cur.value : String(cur || "");
+                } catch (e) { xml = "READ FAILED: " + (e && e.message ? e.message : e); }
+                const short = xml.replace(/(data:image\/[a-z]+;base64,)[A-Za-z0-9+\/=]{80,}/g, "$1<...base64 removed...>");
+                out += `===== LAYER ${l.name} | owner ${l.owner} | ${l.id} | ${xml.length} chars =====\n${short}\n\n`;
+            }
+            const url = URL.createObjectURL(new Blob([out], { type: "text/plain" }));
+            const a = document.createElement("a");
+            a.href = url; a.download = "sdx-layers-dump.txt";
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+            setStatus(`Dumped ${layers.length} layer(s) to sdx-layers-dump.txt.`);
+        } catch (e) {
+            setStatus("Dump failed: " + (e && e.message ? e.message : e), true);
+        } finally { state.busy = false; }
+    }
+    // Empties ALL markup in a chosen layer (yours or anyone else's on this document).
+    async function onEmptyLayer() {
+        if (state.busy) return;
+        state.busy = true;
+        try {
+            const layers = await allDocLayers();
+            if (!layers.length) { setStatus("No layers found.", true); return; }
+            const pick = prompt("EMPTY a layer (deletes every comment in it).\nType the number of the layer:\n\n" +
+                layers.map((l, i) => `${i + 1}. ${l.name}${l.owner ? " (" + l.owner + ")" : ""}`).join("\n"));
+            const idx = Number(pick) - 1;
+            if (!pick || !layers[idx]) { setStatus("Cancelled."); return; }
+            const l = layers[idx];
+            if (!confirm(`Delete ALL comments in "${l.name}"${l.owner ? " owned by " + l.owner : ""}? This cannot be undone.`)) { setStatus("Cancelled."); return; }
+            const empty = '<?xml version="1.0" encoding="UTF-8" ?><xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve"><annots></annots></xfdf>';
+            await api("/SDA/SaveMarkup", { method: "POST", body: { MarkupOBID: l.id, MarkupContent: empty, ...state.saveTemplate } });
+            alert(`Layer "${l.name}" was emptied. The page will reload.`);
+            location.reload();
+        } catch (e) {
+            setStatus("Empty layer failed: " + (e && e.message ? e.message : e), true);
+        } finally { state.busy = false; }
+    }
     async function onUndo(mode) {
         if (state.busy) return;
         const layerId = document.getElementById("sdxbmLayer").value;
@@ -1387,6 +1489,7 @@
         }
         const merged = mergeIntoXfdf(existing, conv.items);
         if (!merged.added) return { added: 0, duplicates: merged.duplicates, skipped: conv.skipped };
+        if (merged.xml.length > 12 * 1024 * 1024) throw new Error(`Layer would be ${(merged.xml.length / 1048576).toFixed(1)} MB, which can lock up the SDx viewer. Nothing was saved. Import fewer images or use a new layer.`);
         await api("/SDA/SaveMarkup", {
             method: "POST",
             body: { MarkupOBID: layerId, MarkupContent: merged.xml, ...state.saveTemplate }
@@ -2041,7 +2144,10 @@
                 <div class="row"><button type="button" class="b p" id="sdxbmImport" ${p && !blocked && (state.layers.length || canCreate) ? "" : "disabled"}>Import into SDx layer</button>
                 <button type="button" class="b" id="sdxbmDownload" ${state.converted ? "" : "disabled"}>Download XFDF (debug)</button></div>
                 <div class="row" style="margin-top:8px"><button type="button" class="b" id="sdxbmUndo" ${state.layers.length ? "" : "disabled"} title="Remove the comments added by the most recent import into the selected layer">Undo last import</button>
-                <button type="button" class="b" id="sdxbmRemoveAll" ${state.layers.length ? "" : "disabled"} title="Remove every comment this tool has ever added to the selected layer">Remove all imported</button></div></div>`;
+                <button type="button" class="b" id="sdxbmRemoveAll" ${state.layers.length ? "" : "disabled"} title="Remove every comment this tool has ever added to the selected layer">Remove all imported</button>
+                <button type="button" class="b" id="sdxbmRepair" title="Fix layers saved by v1.0.x that lock up the SDx review popup">Repair broken layers</button>
+                <button type="button" class="b" id="sdxbmDump" title="Download the raw markup of every layer on this document (for troubleshooting)">Dump all layers (debug)</button>
+                <button type="button" class="b" id="sdxbmEmpty" title="Delete every comment in a layer you choose, including other people's">Empty a layer...</button></div></div>`;
         const drop = document.getElementById("sdxbmDrop");
         const fileInput = document.getElementById("sdxbmFile");
         fileInput.addEventListener("change", () => handleFile(fileInput.files && fileInput.files[0]));
@@ -2081,6 +2187,9 @@
         document.getElementById("sdxbmDownload").addEventListener("click", onDownload);
         document.getElementById("sdxbmUndo").addEventListener("click", () => onUndo("last"));
         document.getElementById("sdxbmRemoveAll").addEventListener("click", () => onUndo("all"));
+        document.getElementById("sdxbmRepair").addEventListener("click", onRepair);
+        document.getElementById("sdxbmDump").addEventListener("click", onDumpLayers);
+        document.getElementById("sdxbmEmpty").addEventListener("click", onEmptyLayer);
         document.getElementById("sdxbmRecheck")?.addEventListener("click", () => { state.sdxPages = null; runRevisionCheck(); });
         document.getElementById("sdxbmChkContinue")?.addEventListener("click", () => { state.checkAck = true; setStatus("Continuing with the uploaded PDF. Pick your layer, then import."); render(); });
         document.getElementById("sdxbmChkRemove")?.addEventListener("click", () => {
