@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.2.1
+// @version      1.2.2
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -18,7 +18,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.2.1";
+    const VERSION = "1.2.2";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -721,7 +721,25 @@
         return undefined;
     }
 
+    // The @require libraries occasionally fail to load (blocked CDN, cached failed download). Try loading
+    // pdf-lib straight from the CDN once, and explain clearly if that fails too.
+    function loadScriptOnce(src) {
+        return new Promise((resolve, reject) => {
+            const el = document.createElement("script");
+            el.src = src; el.onload = () => resolve(); el.onerror = () => reject(new Error("blocked or unreachable: " + src));
+            document.head.appendChild(el);
+        });
+    }
+    async function ensureLibs() {
+        if (window.PDFLib && window.PDFLib.PDFDocument) return;
+        try { await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"); } catch (e) { warn(e); }
+        if (!(window.PDFLib && window.PDFLib.PDFDocument)) {
+            throw new Error("the pdf-lib library did not load. Your network or browser is probably blocking cdnjs.cloudflare.com, or Tampermonkey cached a failed download. In Tampermonkey open this script > Settings > Externals and update/clear the libraries, then reload SDx. If it still fails, ask IT to allow cdnjs.cloudflare.com and cdn.jsdelivr.net.");
+        }
+    }
+
     async function readBluebeamPdf(arrayBuffer) {
+        await ensureLibs();
         const P = window.PDFLib;
         const doc = await P.PDFDocument.load(arrayBuffer, { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
         const ctx = doc.context;
@@ -1525,6 +1543,7 @@
         if (!url) return null;
         const res = await fetch(url, { credentials: "include" });
         if (!res.ok) return null;
+        await ensureLibs();
         const doc = await window.PDFLib.PDFDocument.load(await res.arrayBuffer(), { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
         return doc.getPages().map(pg => { const b = pg.getCropBox(); return { w: b.width, h: b.height }; });
     }
