@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.1.3
+// @version      1.2.1
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -18,7 +18,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.1.3";
+    const VERSION = "1.2.1";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -92,10 +92,55 @@
         return v || "None";
     }
 
+    // Splits a path into dash strokes (one stroke per dash) so a dashed line can be drawn as a single
+    // ink annotation. Used when SDx does not keep the dash pattern of a normal line.
+    function dashStrokes(pts, pattern) {
+        let pat = (pattern || []).map(Number).filter(v => Number.isFinite(v) && v >= 0);
+        if (!pat.length || pat.every(v => v === 0)) return [pts];
+        if (pat.length % 2) pat = pat.concat(pat);
+        let total = 0;
+        for (let i = 0; i < pts.length - 1; i++) total += Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+        const period = pat.reduce((x, y) => x + y, 0) || 1;
+        if (total / period > 3000) return null;
+        const strokes = [];
+        let idx = 0, rem = Math.max(pat[0], 0.01), on = true, cur = [pts[0].slice()];
+        for (let i = 0; i < pts.length - 1; i++) {
+            const A = pts[i], B = pts[i + 1];
+            const L = Math.hypot(B[0] - A[0], B[1] - A[1]);
+            let pos = 0;
+            while (L - pos > 1e-9) {
+                const step = Math.min(rem, L - pos);
+                const t = (pos + step) / L;
+                const P = [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t];
+                if (on) cur.push(P);
+                pos += step; rem -= step;
+                if (rem <= 1e-9) {
+                    if (on) { strokes.push(cur); cur = null; }
+                    on = !on; idx = (idx + 1) % pat.length; rem = Math.max(pat[idx], 0.01);
+                    if (on) cur = [P.slice()];
+                }
+            }
+            if (on && cur && i < pts.length - 2) { /* stroke continues around the corner */ }
+        }
+        if (on && cur && cur.length > 1) strokes.push(cur);
+        return strokes.filter(st => st.length > 1);
+    }
+
     // Stamps, snapshots and Bluebeam pasted images (a Square with IT=SquareImage
     // whose picture lives in its appearance stream) are all imported as image stamps.
     function isImageAnnot(a) {
         return !!a && (a.Subtype === "Stamp" || (a.Subtype === "Square" && a.IT === "SquareImage"));
+    }
+
+    // Bluebeam keeps transparency in /CA, in a separate /FillOpacity, or only inside the appearance stream
+    // (read at parse time into __apOpacity). Use whichever says the annotation is translucent.
+    function opacityOf(a, type) {
+        const vals = [];
+        if (Number.isFinite(Number(a.CA)) && a.CA !== undefined) vals.push(Number(a.CA));
+        if (type !== "FreeText" && Number.isFinite(Number(a.FillOpacity)) && a.FillOpacity !== undefined) vals.push(Number(a.FillOpacity));
+        if (Number.isFinite(Number(a.__apOpacity)) && a.__apOpacity !== undefined) vals.push(Number(a.__apOpacity));
+        const v = vals.length ? Math.min(...vals) : 1;
+        return v < 1 ? num(v) : null;
     }
 
     // opts: { page, author, markupOBID, name, parentName, importedAt }
@@ -118,7 +163,7 @@
             subject: a.Subj,
             date: a.M || a.CreationDate,
             creationdate: a.CreationDate || a.M,
-            opacity: a.CA !== undefined && a.CA !== 1 ? num(a.CA) : null,
+            opacity: opacityOf(a, type),
             width: width !== undefined ? num(width) : null,
             "interior-color": colorHex(a.IC),
             IT: a.IT,
@@ -128,6 +173,23 @@
         if (border.S === "D" && Array.isArray(border.D)) {
             common.style = "dash";
             common.dashes = numList(border.D);
+        }
+        // Bluebeam custom line styles (e.g. "Hot Water" with repeating text) are not supported by SDx:
+        // approximate them with a dash pattern so the line reads as a non-solid line type.
+        let approx = null, lsContents = "";
+        if (!common.style && Array.isArray(a.LineStyle) && Array.isArray(a.LineStyle[1]) && (type === "PolyLine" || type === "Polygon" || type === "Line")) {
+            const inner = a.LineStyle[1];
+            const on = inner.find(v => typeof v === "number" && v > 0) || 12;
+            let gap = 0;
+            for (const el of inner) {
+                if (Array.isArray(el)) gap += String(el[0] || "").length * (Number(el[2]) || 8) * 0.65 + 6;
+            }
+            if (!gap) gap = Math.max(4, on / 3);
+            common.style = "dash";
+            common.dashes = numList([on, gap]);
+            const nm = a.LineStyleName || "custom";
+            lsContents = `Line style: ${nm}`;
+            approx = `Line style "${nm}" drawn as a dashed line (its text or symbols are not reproduced)`;
         }
         if (a.BE && a.BE.S === "C") {
             common.style = "cloudy";
@@ -143,10 +205,38 @@
             bbSubject: a.Subj || "",
             bbImportedAt: opts.importedAt
         };
-        const contents = a.Contents ? `<contents>${xmlEsc(a.Contents)}</contents>` : "";
+        const contents = (a.Contents || lsContents) ? `<contents>${xmlEsc(a.Contents || lsContents)}</contents>` : "";
         let tag = type.toLowerCase();
         let extra = {};
         let body = "";
+        let parts = [];
+        // Builds an XFDF element for a helper shape. suffix "" = the primary element (keeps the Bluebeam name).
+        // Helper shapes are grouped under the primary one so they travel with it and are removed with it on undo.
+        const mkChild = (suffix, ctag, crect, cextra, cbody) => {
+            const primary = !suffix;
+            const ce = Object.assign({}, cextra);
+            const c = {
+                page: opts.page,
+                rect: numList(crect),
+                color: ce.color || null,
+                flags: common.flags,
+                name: primary ? opts.name : `${opts.name}-${suffix}`,
+                title: opts.author,
+                subject: a.Subj,
+                date: common.date,
+                creationdate: common.creationdate,
+                width: ce.width !== undefined ? ce.width : null,
+                inreplyto: primary ? opts.parentName : null,
+                replytype: primary ? common.replytype : null
+            };
+            delete ce.color; delete ce.width;
+            const cust = `<trn-custom-data bytes="${xmlEsc(JSON.stringify(Object.assign({}, custom, { bbName: (a.NM || "") + (suffix ? "-" + suffix : "") })))}"/>`;
+            return { suffix, tag: ctag, xml: `<${ctag} ${attrs(Object.assign({}, c, ce))}>${cust}${cbody || ""}</${ctag}>` };
+        };
+        const bbox = (pts, pad) => {
+            const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+            return [Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad];
+        };
         switch (type) {
             case "FreeText": {
                 tag = "freetext";
@@ -159,10 +249,94 @@
                     head: a.CL ? lineEnding(a.LE, 0) : null
                 };
                 body = `${contents}${da.da ? `<defaultappearance>${xmlEsc(da.da)}</defaultappearance>` : ""}${a.DS ? `<defaultstyle>${xmlEsc(a.DS)}</defaultstyle>` : ""}`;
+                // SDx callouts have one leader. Bluebeam notes with several leaders keep the extras in BsiCLAux:
+                // each leader is [tip..., knee, edge]. Leader 0's first tip is the native one; draw the rest as arrows.
+                if (!Array.isArray(a.BsiCLAux) && Array.isArray(a.CLEx) && a.CLEx.length >= 2 && Array.isArray(a.CL) && a.CL.length >= 4) {
+                    // No leader detail: join every extra tip to the first leader's knee.
+                    const base = a.CL.slice(-4, -2).map(Number);
+                    const syn = [];
+                    for (let i = 0; i + 1 < a.CLEx.length; i += 2) syn.push([Number(a.CLEx[i]), Number(a.CLEx[i + 1]), ...base, ...a.CL.slice(-2).map(Number)]);
+                    a = Object.assign({}, a, { BsiCLAux: [a.CL.slice(0, 2).concat(base, a.CL.slice(-2).map(Number))].concat(syn) });
+                }
+                if (Array.isArray(a.BsiCLAux)) {
+                    const lcol = da.color || colorHex(a.C) || "#000000";
+                    const lw = Number(border.W) > 0 ? Number(border.W) : 1;
+                    const le = Array.isArray(a.LE) ? a.LE[0] : a.LE;
+                    let k = 0;
+                    a.BsiCLAux.forEach((ld, li) => {
+                        if (!Array.isArray(ld) || ld.length < 4) return;
+                        const pts = [];
+                        for (let i = 0; i + 1 < ld.length; i += 2) pts.push([Number(ld[i]), Number(ld[i + 1])]);
+                        let tips, knee = null;
+                        const edge = pts[pts.length - 1];
+                        if (pts.length >= 3) { knee = pts[pts.length - 2]; tips = pts.slice(0, -2); }
+                        else tips = [pts[0]];
+                        tips.forEach((tip, ti) => {
+                            if (li === 0 && ti === 0) return;
+                            k++;
+                            const path = knee ? [edge, knee, tip] : [edge, tip];
+                            parts.push(mkChild("L" + k, "polyline", bbox(path, lw + 6),
+                                { color: lcol, width: num(lw), head: "None", tail: le || "OpenArrow" },
+                                `<vertices>${path.map(p => num(p[0]) + "," + num(p[1])).join(";")}</vertices>`));
+                        });
+                    });
+                    if (k) approx = `Callout with several leader lines: ${k} extra leader(s) drawn as separate arrows (they do not move with the text box)`;
+                }
                 break;
             }
             case "Line": {
                 if (!Array.isArray(a.L) || a.L.length < 4) return { skip: "line without coordinates" };
+                if (a.IT === "LineDimension" && Number.isFinite(Number(a.LL))) {
+                    // SDx has no dimension object: rebuild it from extension lines, arrowed dimension line
+                    // segments and a text box, all grouped under the text box.
+                    const P1 = [Number(a.L[0]), Number(a.L[1])], P2 = [Number(a.L[2]), Number(a.L[3])];
+                    const dx = P2[0] - P1[0], dy = P2[1] - P1[1], len = Math.hypot(dx, dy) || 1;
+                    const d = [dx / len, dy / len], n = [-d[1], d[0]];
+                    const LL = Number(a.LL), LLE = Number(a.LLE) || 0, sg = LL < 0 ? -1 : 1;
+                    const at = (P, k) => [P[0] + n[0] * k, P[1] + n[1] * k];
+                    const D1 = at(P1, LL), D2 = at(P2, LL);
+                    const E1 = at(P1, LL + sg * LLE), E2 = at(P2, LL + sg * LLE);
+                    const lw = width !== undefined && width !== null ? Math.max(0.25, Number(width)) : 1;
+                    const dcol = colorHex(a.C) || "#000000";
+                    const text = a.Contents || "";
+                    const dsSize = /([\d.]+)\s*pt/.exec(a.DS || "");
+                    const size = da.size || (dsSize ? Number(dsSize[1]) : 10);
+                    const tw = text.length * size * 0.55 + 6, th = size * 1.5;
+                    const M = [(D1[0] + D2[0]) / 2, (D1[1] + D2[1]) / 2];
+                    const dlen = Math.hypot(D2[0] - D1[0], D2[1] - D1[1]);
+                    const half = Math.min((tw / 2) / Math.max(Math.abs(d[0]), 0.01), (th / 2) / Math.max(Math.abs(d[1]), 0.01)) + 2;
+                    const pad = lw + 5;
+                    const lineEl = (suffix, A, B, head, tail) => mkChild(suffix, "line", bbox([A, B], pad),
+                        { color: dcol, width: num(lw), start: numList(A), end: numList(B), head, tail });
+                    const arrows = [lineEnding(a.LE, 0), lineEnding(a.LE, 1)];
+                    const els = [];
+                    let tboxCenter = M;
+                    if (text && dlen > 2 * half + 12) {
+                        els.push(lineEl("d1", D1, [M[0] - d[0] * half, M[1] - d[1] * half], arrows[0], "None"));
+                        els.push(lineEl("d2", [M[0] + d[0] * half, M[1] + d[1] * half], D2, "None", arrows[1]));
+                    } else {
+                        els.push(lineEl("d1", D1, D2, arrows[0], arrows[1]));
+                        if (text) tboxCenter = [M[0] + n[0] * (th / 2 + 2), M[1] + n[1] * (th / 2 + 2)];
+                    }
+                    els.push(lineEl("x1", P1, E1, "None", "None"));
+                    els.push(lineEl("x2", P2, E2, "None", "None"));
+                    if (text) {
+                        const trect = [tboxCenter[0] - tw / 2, tboxCenter[1] - th / 2, tboxCenter[0] + tw / 2, tboxCenter[1] + th / 2];
+                        const rgb = (Array.isArray(a.C) && a.C.length === 3 ? a.C : [0, 0, 0]).join(" ");
+                        const tEl = mkChild("", "freetext", trect,
+                            { width: "0", TextColor: dcol, FontSize: num(size), fringe: null },
+                            `<contents>${xmlEsc(text)}</contents><defaultappearance>${xmlEsc(`${rgb} rg /Helvetica ${num(size)} Tf`)}</defaultappearance>${a.DS ? `<defaultstyle>${xmlEsc(a.DS)}</defaultstyle>` : ""}`);
+                        parts = els;
+                        approx = "Dimension/measurement lines rebuilt as arrowed lines plus a text box (SDx has no measurement object)";
+                        return { xml: tEl.xml, tag: "freetext", parts, approx };
+                    }
+                    const prim = els.shift();
+                    // no label: promote the dimension line itself to the primary element (keeps the Bluebeam name)
+                    const primXml = lineEl("", D1, D2, arrows[0], arrows[1]);
+                    parts = els.filter(e => e.suffix !== "d1" && e.suffix !== "d2");
+                    approx = "Dimension lines rebuilt as arrowed lines (SDx has no measurement object)";
+                    return { xml: primXml.xml, tag: "line", parts, approx };
+                }
                 extra = {
                     start: numList(a.L.slice(0, 2)),
                     end: numList(a.L.slice(2, 4)),
@@ -187,6 +361,21 @@
                     extra = { head: lineEnding(a.LE, 0), tail: lineEnding(a.LE, 1) };
                 }
                 body = `${contents}<vertices>${pts.join(";")}</vertices>`;
+                if (opts.dashAsInk && common.style === "dash" && common.dashes) {
+                    // Draw the dashes as separate ink strokes inside ONE ink annotation (works even if SDx drops dash patterns).
+                    const path = [];
+                    for (let i = 0; i + 1 < a.Vertices.length; i += 2) path.push([Number(a.Vertices[i]), Number(a.Vertices[i + 1])]);
+                    if (type === "Polygon" && path.length) path.push(path[0].slice());
+                    const strokes = dashStrokes(path, common.dashes.split(",").map(Number));
+                    if (strokes && strokes.length) {
+                        tag = "ink";
+                        delete common.style; delete common.dashes; delete common.fringe;
+                        common["interior-color"] = null;
+                        extra = {};
+                        body = `${contents}<inklist>${strokes.map(st => `<gesture>${st.map(p => num(p[0]) + "," + num(p[1])).join(";")}</gesture>`).join("")}</inklist>`;
+                        approx = (approx ? approx + "; " : "") + "dashed line drawn as an ink annotation made of separate dashes (not editable as a polyline)";
+                    }
+                }
                 break;
             }
             case "Ink": {
@@ -237,13 +426,14 @@
         }
         const customXml = `<trn-custom-data bytes="${xmlEsc(JSON.stringify(custom))}"/>`;
         const xml = `<${tag} ${attrs({ ...common, ...extra })}>${customXml}${body}</${tag}>`;
-        return { xml, tag };
+        return { xml, tag, parts, approx };
     }
 
     // Walks a list of { page, index, a, parentNM } and returns XFDF fragments.
     function convertAll(items, ctx) {
         const out = [];
         const skipped = [];
+        const approx = [];
         const importedAt = ctx.importedAt || new Date().toISOString();
         for (const it of items) {
             const a = it.a;
@@ -259,6 +449,7 @@
                 res = annotToXfdf(a, {
                 imageData: it.imageData,
                 stampOpacity: ctx.stampOpacity,
+                dashAsInk: ctx.dashAsInk,
                 page: it.page,
                 author: ctx.author,
                 markupOBID: ctx.markupOBID,
@@ -270,9 +461,13 @@
                 res = { skip: "conversion error: " + (e && e.message ? e.message : e) };
             }
             if (res.skip) skipped.push({ page: it.page, type: a.Subtype || "?", subject: a.Subj || "", reason: res.skip });
-            else out.push({ name: "bb-" + nm, xml: res.xml, tag: res.tag, page: it.page, author: a.T || "", subject: a.Subj || "" });
+            else {
+                out.push({ name: "bb-" + nm, xml: res.xml, tag: res.tag, page: it.page, author: a.T || "", subject: a.Subj || "" });
+                for (const pt of res.parts || []) out.push({ name: "bb-" + nm + "-" + pt.suffix, xml: pt.xml, tag: pt.tag, page: it.page, author: a.T || "", subject: a.Subj || "", child: true });
+                if (res.approx) approx.push({ page: it.page, type: a.Subtype || "?", subject: a.Subj || "", reason: res.approx });
+            }
         }
-        return { items: out, skipped };
+        return { items: out, skipped, approx };
     }
 
     // PDF 32000 12.5.5: the appearance BBox is transformed by its Matrix, and the
@@ -556,6 +751,26 @@
                         parentNM = nmObj ? nmObj.decodeText() : null;
                     }
                 } catch {}
+                try {
+                    const apD0 = dict.lookupMaybe(P.PDFName.of("AP"), P.PDFDict);
+                    const n0 = apD0 && ctx.lookup(apD0.get(P.PDFName.of("N")));
+                    const res0 = n0 && n0.dict && n0.dict.lookupMaybe(P.PDFName.of("Resources"), P.PDFDict);
+                    const egs = res0 && res0.lookupMaybe(P.PDFName.of("ExtGState"), P.PDFDict);
+                    if (egs) {
+                        let m = 1;
+                        for (const [k, v] of egs.entries()) {
+                            if (/_TEXT$/i.test(k.decodeText())) continue;
+                            const gs = ctx.lookup(v);
+                            const gd = gs && (gs.dict || gs);
+                            if (!gd || !gd.lookupMaybe) continue;
+                            for (const key of ["ca", "CA"]) {
+                                const nv = gd.lookupMaybe(P.PDFName.of(key), P.PDFNumber);
+                                if (nv) m = Math.min(m, nv.asNumber());
+                            }
+                        }
+                        if (m < 1) a.__apOpacity = m;
+                    }
+                } catch {}
                 let ap = null;
                 if (isImageAnnot(a)) {
                     try {
@@ -743,7 +958,8 @@
         view: "import",
         work: { dir: null, dirName: "", fileHandle: null, fileName: "", baseline: 0, lastSeen: 0, stable: 0, savedAt: 0, notified: 0, auto: false, includeExisting: readJson("sdxbm_include_existing", true) !== false, existing: null, existingNote: "", unlock: readJson("sdxbm_unlock", true) !== false, unlockNote: "", timer: null, path: readJson("sdxbm_work_path", ""), old: null, oldChecked: false, oldNote: "", autoChecked: false },
         sdxPages: null,
-        stampOpacity: Math.min(1, Math.max(0, Number(readJson("sdxbm_stamp_opacity", 0.7)) || 0.7))
+        stampOpacity: Math.min(1, Math.max(0, Number(readJson("sdxbm_stamp_opacity", 0.7)) || 0.7)),
+        dashAsInk: Boolean(readJson("sdxbm_dash_ink", false))
     };
 
     function log(...a) { console.log(`%c${ICON} [${TOOL} v${VERSION}]`, "color:#0078d4;font-weight:bold", ...a); }
@@ -1480,7 +1696,7 @@
                 warn("Stamp render failed:", e);
             }
         }
-        const conv = convertAll(items, { author: me.userName, markupOBID: layerId, stampOpacity: state.stampOpacity });
+        const conv = convertAll(items, { author: me.userName, markupOBID: layerId, stampOpacity: state.stampOpacity, dashAsInk: state.dashAsInk });
         for (const it of outOfRange) conv.skipped.push({ page: it.page, type: it.a.Subtype || "?", subject: it.a.Subj || "", reason: "page does not exist in the SDx document" });
         let existing = "";
         if (!(opts && opts.isNew)) {
@@ -1488,13 +1704,13 @@
             existing = typeof current === "object" ? current.value : String(current || "");
         }
         const merged = mergeIntoXfdf(existing, conv.items);
-        if (!merged.added) return { added: 0, duplicates: merged.duplicates, skipped: conv.skipped };
+        if (!merged.added) return { added: 0, duplicates: merged.duplicates, skipped: conv.skipped, approx: conv.approx || [] };
         if (merged.xml.length > 12 * 1024 * 1024) throw new Error(`Layer would be ${(merged.xml.length / 1048576).toFixed(1)} MB, which can lock up the SDx viewer. Nothing was saved. Import fewer images or use a new layer.`);
         await api("/SDA/SaveMarkup", {
             method: "POST",
             body: { MarkupOBID: layerId, MarkupContent: merged.xml, ...state.saveTemplate }
         });
-        return { added: merged.added, duplicates: merged.duplicates, skipped: conv.skipped, xml: merged.xml };
+        return { added: merged.added, duplicates: merged.duplicates, skipped: conv.skipped, approx: conv.approx || [], xml: merged.xml };
     }
 
     /************************************************************
@@ -2088,6 +2304,7 @@
             <div class="row" style="margin-top:8px"><label style="font-size:12px">Description (optional):
             <input type="text" id="sdxbmDesc" maxlength="200" value="${esc(state.newLayer.desc)}" placeholder="e.g. Structural review comments" style="width:340px;height:28px;border:1px solid #b9c5d0;border-radius:6px;padding:0 8px"></label></div>` : "";
         const stampCount = p ? p.items.filter(it => it.a.Subtype === "Stamp" && it.ap).length : 0;
+        const dashCount = p ? p.items.filter(it => (it.a.BS && it.a.BS.S === "D" && Array.isArray(it.a.BS.D) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon")) || (Array.isArray(it.a.LineStyle) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon"))).length : 0;
         const chk = state.check;
         const blocked = blockedByCheck();
         let checkHtml = "";
@@ -2103,11 +2320,13 @@
         const curStep = !p || blocked ? 1 : (state.step2Done ? 3 : 2);
         const lr = state.lastResult;
         let resultHtml = "";
-        if (lr && (lr.skipped.length || !lr.added)) {
+        if (lr && (lr.skipped.length || !lr.added || (lr.approx && lr.approx.length))) {
             const rows = summarizeSkipped(lr.skipped).map(g => `<tr><td>${esc(g.type)}</td><td>${g.count}</td><td>${esc(formatPages(g.pages) || "-")}</td><td>${esc(g.reason)}</td></tr>`).join("");
-            resultHtml = `<div class="chk ${lr.added ? "warn" : "fail"}" style="margin-bottom:12px">
-                <b>${lr.added ? `Imported ${lr.added} comment(s), but ${lr.skipped.length} did not come in.` : `No comments were imported${lr.duplicates ? ` (${lr.duplicates} were already in the layer)` : ""}.`}</b>
+            const apx = summarizeSkipped(lr.approx || []).map(g => `<tr><td>${esc(g.type)}</td><td>${g.count}</td><td>${esc(formatPages(g.pages) || "-")}</td><td>${esc(g.reason)}</td></tr>`).join("");
+            resultHtml = `<div class="chk ${lr.added && !lr.skipped.length ? "ok" : lr.added ? "warn" : "fail"}" style="margin-bottom:12px">
+                <b>${lr.added ? (lr.skipped.length ? `Imported ${lr.added} comment(s), but ${lr.skipped.length} did not come in.` : `Imported ${lr.added} comment(s).`) : `No comments were imported${lr.duplicates ? ` (${lr.duplicates} were already in the layer)` : ""}.`}</b>
                 ${rows ? `<table style="margin-top:6px"><tr><th>Comment type</th><th>Count</th><th>Pages</th><th>Reason</th></tr>${rows}</table>` : ""}
+                ${apx ? `<div style="margin-top:8px"><b>Approximated (imported, but not identical to Bluebeam):</b><table style="margin-top:4px"><tr><th>Comment type</th><th>Count</th><th>Pages</th><th>What changed</th></tr>${apx}</table></div>` : ""}
                 ${lr.added ? '<div style="margin-top:8px"><button type="button" class="b p" id="sdxbmReloadPage">Reload page to see the imported comments</button></div>' : ""}</div>`;
         }
         let preview = "";
@@ -2136,6 +2355,9 @@
                 ${newRow}
                 <div class="row" style="margin-top:10px"><button type="button" class="b ${state.step2Done ? "" : "p"}" id="sdxbmStep2Ok" ${p && !blocked ? "" : "disabled"}>${state.step2Done ? "&#10003; Looks good" : "Looks good - continue"}</button>
                 <span style="color:#666;font-size:12px">The defaults here are usually fine. Change them only if you need to.</span></div></div>
+            ${dashCount ? `<div class="step"><h4>Dashed lines</h4>
+                <label style="font-size:12px"><input type="checkbox" id="sdxbmDashInk" ${state.dashAsInk ? "checked" : ""}> Draw dashed lines as separate dashes (ink)</label>
+                <div style="color:#666;font-size:12px;margin-top:4px">${dashCount} dashed or custom-style line(s) found. Leave this off first. Turn it on if dashed lines show up solid in SDx; they then become ink annotations that cannot be edited as lines.</div></div>` : ""}
             ${stampCount ? `<div class="step"><h4>Snapshot / stamp opacity</h4>
                 <div class="row"><input type="range" id="sdxbmOpacity" min="0" max="100" step="5" value="${Math.round(state.stampOpacity * 100)}" style="width:260px">
                 <b id="sdxbmOpacityVal">${Math.round(state.stampOpacity * 100)}%</b>
@@ -2176,6 +2398,10 @@
         document.getElementById("sdxbmReloadPage")?.addEventListener("click", () => location.reload());
         if (choice === "__new__" && !state.createOpts) loadCreateOptions().then(() => { if (state.view !== "export") render(); }).catch(e => warn(e));
         document.getElementById("sdxbmImport").addEventListener("click", onImport);
+        document.getElementById("sdxbmDashInk")?.addEventListener("change", e => {
+            state.dashAsInk = e.target.checked;
+            writeJson("sdxbm_dash_ink", state.dashAsInk);
+        });
         const slider = document.getElementById("sdxbmOpacity");
         if (slider) {
             slider.addEventListener("input", () => {
@@ -2265,10 +2491,15 @@
             }
             setStatus("Importing...");
             const r = await runImport(layerId, authors, { isNew });
-            state.lastResult = { added: r.added, duplicates: r.duplicates, skipped: r.skipped || [] };
+            state.lastResult = { added: r.added, duplicates: r.duplicates, skipped: r.skipped || [], approx: r.approx || [] };
             state.busy = false;
             if (!r.added) {
                 setStatus(r.duplicates ? `Nothing new to import (${r.duplicates} already in the layer).` : "No comments were imported. See the summary above.", true);
+                render();
+                return;
+            }
+            if (r.approx && r.approx.length && !r.skipped.length) {
+                setStatus(`Imported ${r.added} comment(s). ${r.approx.length} were approximated - see the note above. Reload the page when ready.`);
                 render();
                 return;
             }
