@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.2.2
+// @version      1.4.0
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -18,7 +18,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.2.2";
+    const VERSION = "1.4.0";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -134,12 +134,21 @@
 
     // Bluebeam keeps transparency in /CA, in a separate /FillOpacity, or only inside the appearance stream
     // (read at parse time into __apOpacity). Use whichever says the annotation is translucent.
-    function opacityOf(a, type) {
+    // Bluebeam highlighters (text Highlight, or a freehand "Highlight" ink) use a Multiply blend, so they are
+    // see-through even at 100%. SDx does not blend, so give them a default translucency instead.
+    function isHighlightLike(a, type) {
+        return type === "Highlight" || a.BM === "Multiply" || (type === "Ink" && /highlight/i.test(String(a.Subj || "")));
+    }
+    function opacityOf(a, type, opts) {
         const vals = [];
         if (Number.isFinite(Number(a.CA)) && a.CA !== undefined) vals.push(Number(a.CA));
         if (type !== "FreeText" && Number.isFinite(Number(a.FillOpacity)) && a.FillOpacity !== undefined) vals.push(Number(a.FillOpacity));
         if (Number.isFinite(Number(a.__apOpacity)) && a.__apOpacity !== undefined) vals.push(Number(a.__apOpacity));
-        const v = vals.length ? Math.min(...vals) : 1;
+        let v = vals.length ? Math.min(...vals) : 1;
+        if (v >= 1 && isHighlightLike(a, type)) {
+            const h = opts && Number.isFinite(Number(opts.highlightOpacity)) ? Number(opts.highlightOpacity) : 0.7;
+            v = Math.min(1, Math.max(0.05, h));
+        }
         return v < 1 ? num(v) : null;
     }
 
@@ -163,7 +172,7 @@
             subject: a.Subj,
             date: a.M || a.CreationDate,
             creationdate: a.CreationDate || a.M,
-            opacity: opacityOf(a, type),
+            opacity: opacityOf(a, type, opts),
             width: width !== undefined ? num(width) : null,
             "interior-color": colorHex(a.IC),
             IT: a.IT,
@@ -404,9 +413,14 @@
                 // appearance stream to a PNG data URL and passes it in.
                 if (!opts.imageData) return { skip: "stamp image could not be rendered" };
                 tag = "stamp";
+                // Match what the SDx "stamp image" tool saves (seen in the HAR): subject "Stamp", icon "Draft",
+                // typename "stamp". An unknown icon name or subject makes SDx treat it as a rubber stamp,
+                // which has no opacity control.
                 custom["trn-annot-maintain-aspect-ratio"] = "true";
                 custom["trn-unrotated-rect"] = numList(rect);
-                extra = { rotation: "0", icon: "Snapshot", IT: null, color: null, width: null };
+                custom.typename = "stamp";
+                common.subject = "Stamp";
+                extra = { rotation: "0", icon: "Draft", IT: null, color: null, width: null };
                 // Pasted screenshots (Square/SquareImage) stay fully opaque; only snapshots/stamps use the slider.
                 if (a.Subtype === "Stamp" && typeof opts.stampOpacity === "number" && opts.stampOpacity < 1) common.opacity = num(opts.stampOpacity);
                 else common.opacity = null;
@@ -449,6 +463,7 @@
                 res = annotToXfdf(a, {
                 imageData: it.imageData,
                 stampOpacity: ctx.stampOpacity,
+                highlightOpacity: ctx.highlightOpacity,
                 dashAsInk: ctx.dashAsInk,
                 page: it.page,
                 author: ctx.author,
@@ -977,7 +992,9 @@
         work: { dir: null, dirName: "", fileHandle: null, fileName: "", baseline: 0, lastSeen: 0, stable: 0, savedAt: 0, notified: 0, auto: false, includeExisting: readJson("sdxbm_include_existing", true) !== false, existing: null, existingNote: "", unlock: readJson("sdxbm_unlock", true) !== false, unlockNote: "", timer: null, path: readJson("sdxbm_work_path", ""), old: null, oldChecked: false, oldNote: "", autoChecked: false },
         sdxPages: null,
         stampOpacity: Math.min(1, Math.max(0, Number(readJson("sdxbm_stamp_opacity", 0.7)) || 0.7)),
-        dashAsInk: Boolean(readJson("sdxbm_dash_ink", false))
+        dashAsInk: Boolean(readJson("sdxbm_dash_ink", false)),
+        bakeOpacity: Boolean(readJson("sdxbm_bake_opacity", false)),
+        highlightOpacity: Math.min(1, Math.max(0.05, Number(readJson("sdxbm_hl_opacity", 0.7)) || 0.7))
     };
 
     function log(...a) { console.log(`%c${ICON} [${TOOL} v${VERSION}]`, "color:#0078d4;font-weight:bold", ...a); }
@@ -1501,7 +1518,10 @@
     async function collectExistingComments() {
         await loadLayers();
         const layers = [];
-        for (const l of state.otherLayers) {
+        // Every layer on the document: other reviewers' AND your own earlier layers.
+        const seen = new Set();
+        const all = [...state.otherLayers, ...state.layers.map(l => ({ id: l.id, name: l.name, owner: l.owner }))].filter(l => !seen.has(l.id) && seen.add(l.id));
+        for (const l of all) {
             try {
                 const r = await api("/SDA/GetMarkupContent", { method: "POST", body: { MarkupOBID: l.id } });
                 layers.push({ id: l.id, name: l.name, owner: l.owner, xml: typeof r === "object" ? r.value : String(r || "") });
@@ -1698,6 +1718,23 @@
         state.busy = false;
     }
 
+    // Multiplies an image's alpha channel. Used when SDx shows a stamp's opacity setting only after it is touched.
+    function bakeAlpha(dataUrl, alpha) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                const c = document.createElement("canvas");
+                c.width = img.naturalWidth; c.height = img.naturalHeight;
+                const x = c.getContext("2d");
+                x.globalAlpha = alpha;
+                x.drawImage(img, 0, 0);
+                resolve(c.toDataURL("image/png"));
+            };
+            img.onerror = () => reject(new Error("could not decode the stamp image"));
+            img.src = dataUrl;
+        });
+    }
+
     async function runImport(layerId, selectedAuthors, opts) {
         const me = await loadMe();
         let items = state.parsed.items.filter(it => selectedAuthors.has(it.a.T || "(no author)"));
@@ -1710,12 +1747,15 @@
             n++;
             setStatus(`Rendering snapshot/stamp ${n} of ${stamps.length}...`);
             try {
-                it.imageData = it.imageData || await renderStampPng(state.parsed.doc, it, state.parsed.bytes);
+                it.imageDataRaw = it.imageDataRaw || await renderStampPng(state.parsed.doc, it, state.parsed.bytes);
+                it.imageData = it.imageDataRaw;
+                if (state.bakeOpacity && state.stampOpacity < 1 && it.a.Subtype === "Stamp") it.imageData = await bakeAlpha(it.imageDataRaw, state.stampOpacity);
             } catch (e) {
                 warn("Stamp render failed:", e);
             }
         }
-        const conv = convertAll(items, { author: me.userName, markupOBID: layerId, stampOpacity: state.stampOpacity, dashAsInk: state.dashAsInk });
+        const baked = state.bakeOpacity;
+        const conv = convertAll(items, { author: me.userName, markupOBID: layerId, stampOpacity: baked ? 1 : state.stampOpacity, highlightOpacity: state.highlightOpacity, dashAsInk: state.dashAsInk });
         for (const it of outOfRange) conv.skipped.push({ page: it.page, type: it.a.Subtype || "?", subject: it.a.Subj || "", reason: "page does not exist in the SDx document" });
         let existing = "";
         if (!(opts && opts.isNew)) {
@@ -1862,24 +1902,24 @@
      * Export to Bluebeam (stage 1): copy the SDx PDF to a working folder,
      * watch it for a save, then hand it to the import step.
      ************************************************************/
-    function idbOpen() {
+    function idbOpen(factory) {
         return new Promise((resolve, reject) => {
-            const r = indexedDB.open("sdxbm", 1);
+            const r = (factory || indexedDB).open("sdxbm", 1);
             r.onupgradeneeded = () => r.result.createObjectStore("kv");
             r.onsuccess = () => resolve(r.result);
             r.onerror = () => reject(r.error);
         });
     }
-    async function idbGet(key) {
-        const db = await idbOpen();
+    async function idbGet(key, factory) {
+        const db = await idbOpen(factory);
         return new Promise((resolve, reject) => {
             const q = db.transaction("kv").objectStore("kv").get(key);
             q.onsuccess = () => resolve(q.result);
             q.onerror = () => reject(q.error);
         });
     }
-    async function idbSet(key, val) {
-        const db = await idbOpen();
+    async function idbSet(key, val, factory) {
+        const db = await idbOpen(factory);
         return new Promise((resolve, reject) => {
             const tx = db.transaction("kv", "readwrite");
             tx.objectStore("kv").put(val, key);
@@ -1894,6 +1934,64 @@
             if (h) { state.work.dir = h; state.work.dirName = h.name; }
         } catch (e) { warn("Could not restore working folder:", e); }
     }
+    // Some pages run this script where the browser refuses folder access ("third-party context", e.g. SDx
+    // opened inside a frame). In that case the export falls back to a normal browser download.
+    function isBlockedErr(e) {
+        return /third-party|not allowed|SecurityError|NotAllowedError|cross-origin|user activation|no longer associated|execution context/i.test(`${e && e.name} ${e && e.message}`);
+    }
+    // When SDx runs embedded in another site, the browser blocks the folder picker and permission prompt in
+    // the page itself. A small pop-up window is a top-level window, where they ARE allowed; the chosen folder
+    // handle is handed back to this page (same origin), which then reads and writes it as usual.
+    function connectFolderViaPopup(forcePick) {
+        return new Promise((resolve, reject) => {
+            const pw = window.open("", "sdxbm_folder", "popup=yes,width=560,height=380");
+            if (!pw) { reject(new Error("The browser blocked the folder window. Allow pop-ups for this site and try again.")); return; }
+            let done = false;
+            // A folder handle belongs to the window that created it and stops working when that window closes.
+            // So the pop-up stays open (it can be minimized) and the page uses its handle directly.
+            const finish = h => {
+                done = true;
+                state.work.agentWin = pw;
+                try { d2.getElementById("m").textContent = `Connected to "${h.name}". Keep this small window open (minimize it) while you review. The Bluebeam Review tool uses it to save files and watch for your saves. You can close it when you are done.`; d2.getElementById("use").style.display = "none"; d2.getElementById("pick").style.display = "none"; } catch {}
+                try { pw.blur(); window.focus(); } catch {}
+                resolve(h);
+            };
+            const d = pw.document; const d2 = d;
+            d.open(); d.write("<!doctype html><html><head><meta charset='utf-8'><title>SDx Bluebeam Review - folder access</title></head><body></body></html>"); d.close();
+            d.body.style.cssText = "font:14px 'Segoe UI',Arial,sans-serif;padding:20px;color:#1b2b3a";
+            d.body.innerHTML = '<h3 style="margin-top:0">Working folder access</h3><p id="m">Looking for the saved folder...</p><div><button id="use" style="display:none;padding:8px 14px;margin-right:8px">Use saved folder</button><button id="pick" style="padding:8px 14px">Choose folder...</button></div>';
+            const m = d.getElementById("m"), use = d.getElementById("use"), pick = d.getElementById("pick");
+            let saved = null;
+            pw.addEventListener("beforeunload", () => { if (!done) reject(new Error("The folder window was closed.")); });
+            (async () => {
+                try { saved = forcePick ? null : await idbGet("workDir", pw.indexedDB); } catch {}
+                if (saved) { m.textContent = `Saved folder: "${saved.name}". Click to allow access again, or choose another folder.`; use.style.display = ""; }
+                else m.textContent = "Choose the working folder for exported PDFs. This window is needed because SDx is embedded in another site, which blocks folder access inside the page itself.";
+            })();
+            use.onclick = async () => {
+                try {
+                    const p = await saved.requestPermission({ mode: "readwrite" });
+                    if (p === "granted") { try { await idbSet("workDir", saved); } catch {} finish(saved); }
+                    else m.textContent = "Permission was not granted. Try again or choose another folder.";
+                } catch (e) { m.textContent = "Could not use it: " + e.message; }
+            };
+            pick.onclick = async () => {
+                try {
+                    const h = await pw.showDirectoryPicker({ id: "sdxbm-work", mode: "readwrite", startIn: "documents" });
+                    try { await idbSet("workDir", h, pw.indexedDB); } catch {}
+                    try { await idbSet("workDir", h); } catch {}
+                    finish(h);
+                } catch (e) { if (e && e.name !== "AbortError") m.textContent = "Could not use that folder: " + e.message; }
+            };
+        });
+    }
+    function downloadBytes(bytes, name) {
+        const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+        const a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
     async function ensureReadWrite(handle) {
         const opts = { mode: "readwrite" };
         if ((await handle.queryPermission(opts)) === "granted") return true;
@@ -1907,7 +2005,20 @@
             await idbSet("workDir", h);
             setStatus(`Working folder set to "${h.name}".`);
         } catch (e) {
-            if (e && e.name !== "AbortError") { warn(e); setStatus("Could not use that folder: " + e.message, true); }
+            if (e && e.name !== "AbortError") {
+                warn(e);
+                if (isBlockedErr(e)) {
+                    try {
+                        const h = await connectFolderViaPopup(true);
+                        state.work.dir = h; state.work.dirName = h.name; state.work.blocked = false; state.work.dirViaPopup = true;
+                        setStatus(`Working folder set to "${h.name}".`);
+                    } catch (pe) {
+                        state.work.blocked = true;
+                        setStatus("Folder access is blocked on this page: " + pe.message + " The export will download the PDF instead.", true);
+                    }
+                }
+                else setStatus("Could not use that folder: " + e.message, true);
+            }
         }
         render();
     }
@@ -1956,33 +2067,55 @@
     async function exportToWorkFolder() {
         const w = state.work;
         if (state.busy) return;
-        if (!w.dir) { setStatus("Choose a working folder first.", true); return; }
+        if (!w.dir && !w.blocked) { setStatus("Choose a working folder first.", true); return; }
         state.busy = true;
         try {
-            if (!(await ensureReadWrite(w.dir))) throw new Error("Folder access was not granted.");
+            if (w.dirViaPopup && (!w.agentWin || w.agentWin.closed)) { w.dir = null; w.dirViaPopup = false; w.blocked = true; }
+            let useDir = Boolean(w.dir) && !w.blocked;
+            if (useDir && w.dirViaPopup) {
+                // handle from the open pop-up window: already authorised there
+            } else if (useDir) {
+                try {
+                    if (!(await ensureReadWrite(w.dir))) throw new Error("Folder access was not granted.");
+                } catch (e) {
+                    if (!isBlockedErr(e)) throw e;
+                    warn("Folder access blocked in this page, trying the folder window:", e);
+                    w.blocked = true; useDir = false;
+                }
+            }
+            if (!useDir) {
+                try {
+                    setStatus("Opening the folder window...");
+                    const h = await connectFolderViaPopup(false);
+                    w.dir = h; w.dirName = h.name; w.blocked = false; w.dirViaPopup = true; useDir = true;
+                } catch (pe) {
+                    warn("Folder window failed:", pe);
+                    w.popupNote = pe.message; w.blocked = true;
+                }
+            }
             setStatus("Getting the PDF from SDx...");
             const pdf = await getSdxPdf();
             w.existing = null; w.existingNote = "";
             if (w.includeExisting) {
                 try {
-                    setStatus("Reading other reviewers' comments...");
+                    setStatus("Reading existing comments from all layers...");
                     const ex = await collectExistingComments();
                     if (ex.count) {
                         w.existing = ex.summary;
                         try {
                             setStatus(`Embedding ${ex.count} existing comment(s)...`);
                             pdf.bytes = await embedXfdfViaViewer(ex.xml);
-                            w.existingNote = `Embedded ${ex.count} comment(s) from ${ex.layerCount} other layer(s) as locked markups in the copy. They are ignored when you import.`;
+                            w.existingNote = `Embedded ${ex.count} comment(s) from ${ex.layerCount} layer(s) as locked markups in the copy. They are ignored when you import.`;
                         } catch (e) {
                             warn("Embedding existing comments failed:", e);
-                            w.existingNote = `Found ${ex.count} comment(s) from other reviewers but could not embed them in the PDF (${e.message}). They are listed below instead.`;
+                            w.existingNote = `Found ${ex.count} comment(s) from earlier layers but could not embed them in the PDF (${e.message}). They are listed below instead.`;
                         }
                     } else {
-                        w.existingNote = "No comments from other reviewers on this document.";
+                        w.existingNote = "No existing comments on this document.";
                     }
                 } catch (e) {
                     warn("Could not read existing comments:", e);
-                    w.existingNote = "Could not read other reviewers' comments: " + e.message;
+                    w.existingNote = "Could not read existing comments: " + e.message;
                 }
             }
             w.unlockNote = "";
@@ -1996,10 +2129,31 @@
                 w.unlockNote = "Could not check/remove the PDF's restrictions: " + e.message;
             }
             const name = `${pdf.name}_${stampForName()}.pdf`;
-            const fh = await w.dir.getFileHandle(name, { create: true });
-            const wr = await fh.createWritable();
-            await wr.write(pdf.bytes);
-            await wr.close();
+            if (!useDir) {
+                downloadBytes(pdf.bytes, name);
+                if (w.timer) { clearInterval(w.timer); w.timer = null; }
+                Object.assign(w, { fileHandle: null, fileName: name, downloaded: true, savedAt: 0 });
+                setStatus(`Downloaded ${name} to your browser's Downloads folder. Open it in Bluebeam, save, then drag it into the Import tab.`);
+                state.busy = false;
+                render();
+                return;
+            }
+            w.downloaded = false;
+            let fh;
+            try {
+                fh = await w.dir.getFileHandle(name, { create: true });
+                const wr = await fh.createWritable();
+                await wr.write(pdf.bytes);
+                await wr.close();
+            } catch (we) {
+                if (!isBlockedErr(we)) throw we;
+                warn("Writing to the folder is blocked in this page, downloading instead:", we);
+                w.blocked = true;
+                downloadBytes(pdf.bytes, name);
+                Object.assign(w, { fileHandle: null, fileName: name, downloaded: true, savedAt: 0 });
+                setStatus(`The page could not write to the folder, so ${name} was downloaded to your Downloads folder. Open it in Bluebeam, save, then drag it into the Import tab.`);
+                state.busy = false; render(); return;
+            }
             const f = await fh.getFile();
             Object.assign(w, { fileHandle: fh, fileName: name, baseline: f.lastModified, lastSeen: f.lastModified, stable: 0, savedAt: 0, notified: 0 });
             startWatch();
@@ -2075,7 +2229,7 @@
         const fsa = typeof window.showDirectoryPicker === "function";
         const saved = w.savedAt ? new Date(w.savedAt).toLocaleTimeString() : "";
         const cs = cleanupSettings();
-        const cur = !w.dirName ? 1 : (!w.fileName ? 2 : 3);
+        const cur = w.blocked ? (!w.fileName ? 2 : 3) : (!w.dirName ? 1 : (!w.fileName ? 2 : 3));
         let oldHtml = "";
         if (w.old && w.old.length) {
             const mb = (w.old.reduce((n, f) => n + f.size, 0) / 1048576).toFixed(1);
@@ -2091,6 +2245,7 @@
         }
         body.innerHTML = `
             ${fsa ? "" : '<div class="note">This browser does not support folder access. Use Edge or Chrome.</div>'}
+            ${w.blocked ? '<div class="note"><b>Folder access is blocked on this page</b> (SDx is embedded in another site). Click the button below: a small window opens where you pick the folder once. ' + (w.popupNote ? esc(w.popupNote) + " " : "") + 'If that does not work, the PDF is <b>downloaded to your browser\'s Downloads folder</b> instead. Open it in Bluebeam, save it, then drag the saved PDF into the <b>Import from Bluebeam</b> tab.</div>' : ""}
             <div class="note">Copies the PDF you are viewing in SDx into a working folder. Open it in Bluebeam, add your comments, then <b>save</b> (Ctrl+S). This tool cannot launch Bluebeam or see when you close the file, so it watches for the save instead.</div>
             <div class="step ${cur === 1 ? "cur" : ""}"><h4>1. Working folder</h4>
                 <div class="row"><span>${w.dirName ? "<b>" + esc(w.dirName) + "</b>" : "Not chosen yet"}</span>
@@ -2099,18 +2254,18 @@
                     <input type="text" id="sdxbmPath" value="${esc(w.path)}" placeholder="C:\\Users\\you\\Documents\\SDx Bluebeam" style="width:340px;height:28px;border:1px solid #b9c5d0;border-radius:6px;padding:0 8px"></label></div>
                 <div style="font-size:12px;color:#666;margin-top:4px">Edge only tells this script the folder's <i>name</i>, never its location. Open the folder in Explorer, click the address bar, press Ctrl+C, and paste it here once. It is remembered and used by <b>Copy file path</b> in step 3.</div></div>
             <div class="step ${cur === 2 ? "cur" : ""}"><h4>2. Copy the SDx PDF</h4>
-                <div class="row"><button type="button" class="b p" id="sdxbmExportBtn" ${fsa && w.dirName ? "" : "disabled"}>Copy PDF to working folder</button></div>
+                <div class="row"><button type="button" class="b p" id="sdxbmExportBtn" ${(fsa && w.dirName) || w.blocked ? "" : "disabled"}>${w.blocked ? "Choose folder and copy PDF" : "Copy PDF to working folder"}</button></div>
                 <div style="margin-top:8px"><label style="font-size:12px"><input type="checkbox" id="sdxbmUnlock" ${w.unlock ? "checked" : ""}> Remove restrictions (sealed/locked PDFs) from the working copy</label></div>
-                <div style="margin-top:4px"><label style="font-size:12px"><input type="checkbox" id="sdxbmIncExisting" ${w.includeExisting ? "checked" : ""}> Include other reviewers' existing comments in the copy (locked, so you can see what is already marked)</label></div>
+                <div style="margin-top:4px"><label style="font-size:12px"><input type="checkbox" id="sdxbmIncExisting" ${w.includeExisting ? "checked" : ""}> Include all existing comments in the copy, yours from earlier layers and other reviewers' (locked, so you can see what is already marked)</label></div>
                 ${w.existingNote ? `<div class="chk ${/could not/i.test(w.existingNote) ? "warn" : "ok"}" style="margin-top:8px">${esc(w.existingNote)}</div>` : ""}
                 ${w.existing && w.existing.length ? `<details style="margin-top:6px"><summary style="cursor:pointer;font-size:12px">Existing comments (${w.existing.length})</summary>
                     <div style="max-height:200px;overflow:auto"><table><tr><th>Page</th><th>Author</th><th>Type</th><th>Comment</th></tr>${w.existing.slice(0, 300).map(c => `<tr><td>${c.page}</td><td>${esc(c.author)}</td><td>${esc(c.subject || c.type)}</td><td>${esc(c.text.slice(0, 160))}</td></tr>`).join("")}</table></div></details>` : ""}
                 ${w.unlockNote ? `<div class="chk ${/^WARNING|could not|needs a password/i.test(w.unlockNote) ? "warn" : "ok"}" style="margin-top:8px">${esc(w.unlockNote)}</div>` : ""}
-                ${w.fileName ? `<div class="ok" style="margin-top:8px">Saved <b>${esc(w.fileName)}</b> in <b>${esc(w.dirName)}</b>. Open it in Bluebeam (double-click it in that folder).</div>` : ""}</div>
+                ${w.fileName ? (w.downloaded ? `<div class="ok" style="margin-top:8px">Downloaded <b>${esc(w.fileName)}</b> to your Downloads folder. Open it in Bluebeam from there.</div>` : `<div class="ok" style="margin-top:8px">Saved <b>${esc(w.fileName)}</b> in <b>${esc(w.dirName)}</b>. Open it in Bluebeam (double-click it in that folder).</div>`) : ""}</div>
             <div class="step ${cur === 3 ? "cur" : ""}"><h4>3. Comment in Bluebeam, save, then import</h4>
-                <div class="chk ${w.savedAt ? "ok" : "unknown"}">${w.savedAt ? `&#10003; Bluebeam saved the file at ${esc(saved)}. Ready to import.` : (w.fileName ? "Waiting for you to save in Bluebeam... (checked every 10 seconds, or click Check for saved file now)" : "Waiting for step 2.")}</div>
-                <div class="row" style="margin-top:8px"><button type="button" class="b" id="sdxbmCheckNow" ${w.fileName ? "" : "disabled"}>Check for saved file now</button>
-                <button type="button" class="b p" id="sdxbmImportWork" ${w.fileName ? "" : "disabled"}>Import saved comments</button>
+                <div class="chk ${w.savedAt ? "ok" : "unknown"}">${w.savedAt ? `&#10003; Bluebeam saved the file at ${esc(saved)}. Ready to import.` : (w.downloaded ? "Save the file in Bluebeam, then open the Import from Bluebeam tab and drag the saved PDF in. Saves cannot be detected automatically in download mode." : w.fileName ? "Waiting for you to save in Bluebeam... (checked every 10 seconds, or click Check for saved file now)" : "Waiting for step 2.")}</div>
+                <div class="row" style="margin-top:8px"><button type="button" class="b" id="sdxbmCheckNow" ${w.fileName && !w.downloaded ? "" : "disabled"}>Check for saved file now</button>
+                <button type="button" class="b p" id="sdxbmImportWork" ${w.fileName && !w.downloaded ? "" : "disabled"}>Import saved comments</button>
                 <label style="font-size:12px"><input type="checkbox" id="sdxbmAuto" ${w.auto ? "checked" : ""}> Switch to the import step automatically when Bluebeam saves</label></div>
                 ${w.fileName ? `<div class="row" style="margin-top:10px">
                     <button type="button" class="b" id="sdxbmCopyPath">Copy file path</button>
@@ -2183,7 +2338,10 @@
             let perm = await w.dir.queryPermission(opts);
             if (perm !== "granted") {
                 if (!gesture) { w.oldNote = 'Click "Check now" to let the tool look in the folder for old files.'; if (state.view === "export") render(); return; }
-                perm = await w.dir.requestPermission(opts);
+                try { perm = await w.dir.requestPermission(opts); } catch (e) {
+                    if (isBlockedErr(e)) { w.blocked = true; w.oldNote = "Folder access is blocked on this page, so old files cannot be checked."; if (state.view === "export") render(); return; }
+                    throw e;
+                }
                 if (perm !== "granted") return;
             }
             const cutoff = Date.now() - cleanupSettings().days * 86400000;
@@ -2301,6 +2459,9 @@
         if (!body) return;
         const docBar = document.getElementById("sdxbmDoc");
         if (docBar) { const dn = currentDocName(); docBar.innerHTML = dn ? `Reviewing: <b>${esc(dn)}</b>` : "No document detected yet"; docBar.title = dn; }
+        const tabsEl = document.querySelector("#" + IDS.modal + " .tabs");
+        if (tabsEl) tabsEl.style.display = state.importDone ? "none" : "";
+        if (state.importDone) { renderImportDone(body); return; }
         document.getElementById("sdxbmTabExport")?.classList.toggle("active", state.view === "export");
         document.getElementById("sdxbmTabImport")?.classList.toggle("active", state.view !== "export");
         if (state.view === "export") { renderExport(body); return; }
@@ -2323,6 +2484,7 @@
             <div class="row" style="margin-top:8px"><label style="font-size:12px">Description (optional):
             <input type="text" id="sdxbmDesc" maxlength="200" value="${esc(state.newLayer.desc)}" placeholder="e.g. Structural review comments" style="width:340px;height:28px;border:1px solid #b9c5d0;border-radius:6px;padding:0 8px"></label></div>` : "";
         const stampCount = p ? p.items.filter(it => it.a.Subtype === "Stamp" && it.ap).length : 0;
+        const hlCount = p ? p.items.filter(it => isHighlightLike(it.a, it.a.Subtype) && !(Number(it.a.CA) < 1)).length : 0;
         const dashCount = p ? p.items.filter(it => (it.a.BS && it.a.BS.S === "D" && Array.isArray(it.a.BS.D) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon")) || (Array.isArray(it.a.LineStyle) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon"))).length : 0;
         const chk = state.check;
         const blocked = blockedByCheck();
@@ -2377,10 +2539,16 @@
             ${dashCount ? `<div class="step"><h4>Dashed lines</h4>
                 <label style="font-size:12px"><input type="checkbox" id="sdxbmDashInk" ${state.dashAsInk ? "checked" : ""}> Draw dashed lines as separate dashes (ink)</label>
                 <div style="color:#666;font-size:12px;margin-top:4px">${dashCount} dashed or custom-style line(s) found. Leave this off first. Turn it on if dashed lines show up solid in SDx; they then become ink annotations that cannot be edited as lines.</div></div>` : ""}
+            ${hlCount ? `<div class="step"><h4>Highlight opacity</h4>
+                <div class="row"><input type="range" id="sdxbmHl" min="5" max="100" step="5" value="${Math.round(state.highlightOpacity * 100)}" style="width:260px">
+                <b id="sdxbmHlVal">${Math.round(state.highlightOpacity * 100)}%</b>
+                <span style="color:#666;font-size:12px">${hlCount} highlight(s) found. Bluebeam highlights are see-through even at 100%, SDx's are not, so they are imported at this opacity.</span></div></div>` : ""}
             ${stampCount ? `<div class="step"><h4>Snapshot / stamp opacity</h4>
                 <div class="row"><input type="range" id="sdxbmOpacity" min="0" max="100" step="5" value="${Math.round(state.stampOpacity * 100)}" style="width:260px">
                 <b id="sdxbmOpacityVal">${Math.round(state.stampOpacity * 100)}%</b>
-                <span style="color:#666;font-size:12px">${stampCount} snapshot/stamp(s) found. 100% = fully opaque.</span></div></div>` : ""}
+                <span style="color:#666;font-size:12px">${stampCount} snapshot/stamp(s) found. 100% = fully opaque.</span></div>
+                <label style="font-size:12px;display:block;margin-top:6px"><input type="checkbox" id="sdxbmBake" ${state.bakeOpacity ? "checked" : ""}> Bake the opacity into the image</label>
+                <div style="color:#666;font-size:12px">Leave off first. Turn on if snapshots look solid in SDx until you touch the opacity slider there. Baked images look right immediately, but SDx's opacity slider then shows 100% and stacks on top of the baked value.</div></div>` : ""}
             <div class="step ${curStep === 3 ? "cur" : ""}"><h4>3. Import</h4>
                 <div class="row"><button type="button" class="b p" id="sdxbmImport" ${p && !blocked && (state.layers.length || canCreate) ? "" : "disabled"}>Import into SDx layer</button>
                 <button type="button" class="b" id="sdxbmDownload" ${state.converted ? "" : "disabled"}>Download XFDF (debug)</button></div>
@@ -2420,6 +2588,13 @@
         document.getElementById("sdxbmDashInk")?.addEventListener("change", e => {
             state.dashAsInk = e.target.checked;
             writeJson("sdxbm_dash_ink", state.dashAsInk);
+        });
+        document.getElementById("sdxbmBake")?.addEventListener("change", e => { state.bakeOpacity = e.target.checked; writeJson("sdxbm_bake_opacity", state.bakeOpacity); });
+        const hl = document.getElementById("sdxbmHl");
+        if (hl) hl.addEventListener("input", () => {
+            state.highlightOpacity = Number(hl.value) / 100;
+            document.getElementById("sdxbmHlVal").textContent = hl.value + "%";
+            writeJson("sdxbm_hl_opacity", state.highlightOpacity);
         });
         const slider = document.getElementById("sdxbmOpacity");
         if (slider) {
@@ -2486,6 +2661,40 @@
         const c = state.check;
         return Boolean(c && (c.status === "checking" || (c.status === "fail" && !state.checkAck)));
     }
+    // Fingerprint of an uploaded PDF (name, size and a sample of its bytes) used to warn about importing the same file twice.
+    function pdfFingerprint(parsed) {
+        const u8 = new Uint8Array(parsed.bytes);
+        let h = 2166136261;
+        const step = Math.max(1, Math.floor(u8.length / 4096));
+        for (let i = 0; i < u8.length; i += step) { h ^= u8[i]; h = Math.imul(h, 16777619) >>> 0; }
+        return `${parsed.fileName}|${u8.length}|${h}`;
+    }
+    function findPriorImport(parsed) {
+        const fp = pdfFingerprint(parsed);
+        return readJson("sdxbm_imports", []).find(x => x.fp === fp && x.fileOBID === state.fileOBID) || null;
+    }
+    function recordImport(parsed, layerName, added) {
+        const list = readJson("sdxbm_imports", []).filter(x => !(x.fp === pdfFingerprint(parsed) && x.fileOBID === state.fileOBID));
+        list.unshift({ fp: pdfFingerprint(parsed), fileOBID: state.fileOBID, layerName, added, at: Date.now() });
+        writeJson("sdxbm_imports", list.slice(0, 50));
+    }
+    // After a successful import the popup shows only this screen until the page is reloaded.
+    function renderImportDone(body) {
+        const d = state.importDone;
+        const rows = summarizeSkipped(d.skipped).map(g => `<tr><td>${esc(g.type)}</td><td>${g.count}</td><td>${esc(formatPages(g.pages) || "-")}</td><td>${esc(g.reason)}</td></tr>`).join("");
+        const apx = summarizeSkipped(d.approx || []).map(g => `<tr><td>${esc(g.type)}</td><td>${g.count}</td><td>${esc(formatPages(g.pages) || "-")}</td><td>${esc(g.reason)}</td></tr>`).join("");
+        body.innerHTML = `
+            <div class="chk fail glow" style="padding:18px;text-align:center">
+                <div style="font-size:20px;font-weight:700;color:#a4262c">Import complete - reload the page now</div>
+                <div style="margin:8px 0 14px;font-size:13px">Do NOT import again or create another layer until you have reloaded. Working in SDx before reloading can lock up the review panel.</div>
+                <button type="button" class="b p" id="sdxbmReloadNow" style="font-size:16px;height:44px;padding:0 28px">Reload page now</button></div>
+            <div class="step" style="margin-top:14px"><h4>What was imported</h4>
+                <div class="ok">Imported <b>${d.added}</b> comment(s) from <b>${esc(d.fileName)}</b> into <b>${esc(d.layerName)}</b>.${d.duplicates ? ` ${d.duplicates} already in the layer were skipped.` : ""}</div>
+                ${rows ? `<div class="chk warn" style="margin-top:8px"><b>${d.skipped.length} did not come in:</b><table style="margin-top:6px"><tr><th>Comment type</th><th>Count</th><th>Pages</th><th>Reason</th></tr>${rows}</table></div>` : ""}
+                ${apx ? `<div style="margin-top:8px"><b>Approximated (imported, but not identical to Bluebeam):</b><table style="margin-top:4px"><tr><th>Comment type</th><th>Count</th><th>Pages</th><th>What changed</th></tr>${apx}</table></div>` : ""}</div>`;
+        document.getElementById("sdxbmReloadNow").addEventListener("click", () => location.reload());
+    }
+
     async function onImport() {
         if (state.busy) return;
         if (blockedByCheck()) { setStatus("Resolve the warning about the uploaded PDF first (continue with it, or remove it).", true); return; }
@@ -2497,7 +2706,9 @@
         const warning = chk && (chk.status === "fail" || chk.status === "warn") ? `WARNING: ${chk.message}\n\n` : "";
         const typeName = isNew && state.createOpts ? (state.createOpts.types.find(t => t.id === state.newLayer.type) || {}).name : "";
         const what = isNew ? `This creates a new "${typeName || state.newLayer.type}" markup layer in SDx, writes the comments into it,` : "This writes the comments into your SDx markup layer";
-        if (!confirm(warning + what + " and then reloads the page.\n\nAny markup you have drawn in the viewer but NOT yet saved will be lost. Continue?")) return;
+        const prior = state.parsed ? findPriorImport(state.parsed) : null;
+        if (prior && !confirm(`WARNING: you already imported this exact PDF (${prior.added} comment(s) into "${prior.layerName}" on ${new Date(prior.at).toLocaleString()}).\n\nImporting it again${isNew ? " into a new layer" : ""} duplicates the comments and can lock up SDx's review panel.\n\nOnly continue if you really mean to. Continue?`)) return;
+        if (!confirm(warning + what + " and then asks you to reload the page.\n\nAny markup you have drawn in the viewer but NOT yet saved will be lost. Continue?")) return;
         state.busy = true;
         document.getElementById("sdxbmImport").disabled = true;
         state.lastResult = null;
@@ -2517,18 +2728,12 @@
                 render();
                 return;
             }
-            if (r.approx && r.approx.length && !r.skipped.length) {
-                setStatus(`Imported ${r.added} comment(s). ${r.approx.length} were approximated - see the note above. Reload the page when ready.`);
-                render();
-                return;
-            }
-            if (r.skipped.length) {
-                setStatus(`Imported ${r.added} comment(s). ${r.skipped.length} could not be imported - see the summary above. Reload the page when ready.`, true);
-                render();
-                return;
-            }
-            setStatus(`Imported ${r.added} comment(s)${r.duplicates ? `, skipped ${r.duplicates} already present` : ""}. Reloading...`);
-            setTimeout(() => location.reload(), 1800);
+            const sel = document.getElementById("sdxbmLayer");
+            const layerName = isNew ? `a new ${typeName || "markup"} layer` : (state.layers.find(l => l.id === layerId) || {}).name || (sel && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "your layer");
+            try { recordImport(state.parsed, layerName, r.added); } catch (e2) { warn(e2); }
+            state.importDone = { added: r.added, duplicates: r.duplicates, skipped: r.skipped || [], approx: r.approx || [], layerName, fileName: state.parsed ? state.parsed.fileName : "" };
+            setStatus("Import complete. Reload the page now.", true);
+            render();
         } catch (err) {
             warn(err);
             setStatus(err.message, true);
