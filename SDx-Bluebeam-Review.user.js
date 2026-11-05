@@ -6,19 +6,18 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.4.0
+// @version      1.4.1
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
-// @require      https://cdn.jsdelivr.net/npm/@neslinesli93/qpdf-wasm@0.3.0/dist/qpdf.js
 // @grant        none
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.0";
+    const VERSION = "1.4.1";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -1397,19 +1396,28 @@
             try { if (pdf) await pdf.destroy(); } catch {}
         }
     }
+    // qpdf.js defines a global called "Module". The SDx viewer (an emscripten/WebAssembly app) uses the same
+    // global name, so loading qpdf with @require at page start breaks the viewer. Load it only when an unlock
+    // is needed, then put the page's own "Module" back.
+    let qpdfFactory = null;
+    async function getQpdfFactory() {
+        if (qpdfFactory) return qpdfFactory;
+        const had = Object.prototype.hasOwnProperty.call(window, "Module");
+        const prev = window.Module;
+        await new Promise(resolve => {
+            const sc = document.createElement("script");
+            sc.src = QPDF_WASM_URL.replace(/qpdf\.wasm$/, "qpdf.js");
+            sc.onload = sc.onerror = () => resolve();
+            document.head.appendChild(sc);
+        });
+        const f = window.Module;
+        try { window.Module = had ? prev : undefined; } catch {}
+        qpdfFactory = typeof f === "function" && f !== prev ? f : null;
+        return qpdfFactory;
+    }
     async function qpdfDecrypt(bytes) {
-        let factory = typeof Module === "function" ? Module : window.Module;
-        if (typeof factory !== "function") {
-            // Fallback: load qpdf.js as a normal page script so its global "Module" exists.
-            await new Promise(resolve => {
-                const sc = document.createElement("script");
-                sc.src = QPDF_WASM_URL.replace(/qpdf\.wasm$/, "qpdf.js");
-                sc.onload = sc.onerror = () => resolve();
-                document.head.appendChild(sc);
-            });
-            factory = window.Module;
-        }
-        if (typeof factory !== "function") throw new Error("the PDF unlock library (qpdf) did not load - check Tampermonkey's @require access to cdn.jsdelivr.net");
+        const factory = await getQpdfFactory();
+        if (typeof factory !== "function") throw new Error("the PDF unlock library (qpdf) did not load - your network or browser may be blocking cdn.jsdelivr.net");
         // Same flags BentoPDF uses ("--decrypt --remove-restrictions"), then plain --decrypt as a fallback.
         const attempts = [["--decrypt", "--remove-restrictions"], ["--decrypt"]];
         let lastErr = "";
