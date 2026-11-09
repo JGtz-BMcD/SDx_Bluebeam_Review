@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.4.1
+// @version      1.4.2
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.1";
+    const VERSION = "1.4.2";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -2635,7 +2635,8 @@
         if (!file) return;
         try {
             setStatus(`Reading ${file.name} (${(file.size / 1048576).toFixed(1)} MB)...`);
-            let buf = await file.arrayBuffer();
+            // A file read through the folder pop-up's handle comes from another window; copy it into this page's own memory.
+            let buf = toOwnBuffer(await file.arrayBuffer());
             try {
                 const u = await unlockIfNeeded(buf, true);
                 if (u.failed) throw new Error(u.note);
