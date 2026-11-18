@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.5.0
+// @version      1.5.1
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.5.0";
+    const VERSION = "1.5.1";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -2493,6 +2493,8 @@
             <span style="color:#666;font-size:12px">A new layer is created for you when you import.</span></div>
             <div class="row" style="margin-top:8px"><label style="font-size:12px">Description (optional):
             <input type="text" id="sdxbmDesc" maxlength="200" value="${esc(state.newLayer.desc)}" placeholder="e.g. Structural review comments" style="width:340px;height:28px;border:1px solid #b9c5d0;border-radius:6px;padding:0 8px"></label></div>` : "";
+        const selDefault = p ? Array.from(p.authors.keys()).filter(k => !k.startsWith("[SDx] ")).length : 0;
+        const noSel = Boolean(p) && (state.authorSel ? state.authorSel.size === 0 : selDefault === 0);
         const stampCount = p ? p.items.filter(it => it.a.Subtype === "Stamp" && it.ap).length : 0;
         const hlCount = p ? p.items.filter(it => isHighlightLike(it.a, it.a.Subtype) && !(Number(it.a.CA) < 1)).length : 0;
         const dashCount = p ? p.items.filter(it => (it.a.BS && it.a.BS.S === "D" && Array.isArray(it.a.BS.D) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon")) || (Array.isArray(it.a.LineStyle) && (it.a.Subtype === "PolyLine" || it.a.Subtype === "Polygon"))).length : 0;
@@ -2544,7 +2546,10 @@
                 <div id="sdxbmPreview" style="margin-top:8px">${preview}</div></div>
             <div class="step ${curStep === 2 ? "cur" : ""}"><h4>2. Choose your markup layer</h4>
                 <div class="row"><select id="sdxbmLayer">${newOpt}${layerOpts}${!newOpt && !layerOpts ? '<option value="">(no layers found)</option>' : ""}</select>
-                <button type="button" class="b" id="sdxbmReloadLayers">Reload layers</button></div>
+                <button type="button" class="b" id="sdxbmReloadLayers">Reload layers</button>
+                ${choice !== "__new__" && canCreate && state.layers.length ? '<button type="button" class="b p" id="sdxbmMakeNew">Make new layer</button>' : ""}
+                ${choice === "__new__" && state.layers.length ? '<button type="button" class="b" id="sdxbmUseExisting">Use an existing layer</button>' : ""}</div>
+                ${choice !== "__new__" && state.layers.length ? '<div style="font-size:12px;color:#666;margin-top:4px">Comments will be added to the layer shown above. Want a separate layer instead? Click <b>Make new layer</b>.</div>' : ""}
                 ${newRow}
                 <div class="row" style="margin-top:10px"><button type="button" class="b ${state.step2Done ? "" : "p"}" id="sdxbmStep2Ok" ${p && !blocked ? "" : "disabled"}>${state.step2Done ? "&#10003; Looks good" : "Looks good - continue"}</button>
                 <span style="color:#666;font-size:12px">The defaults here are usually fine. Change them only if you need to.</span></div></div>
@@ -2562,6 +2567,7 @@
                 <label style="font-size:12px;display:block;margin-top:6px"><input type="checkbox" id="sdxbmBake" ${state.bakeOpacity ? "checked" : ""}> Bake the opacity into the image</label>
                 <div style="color:#666;font-size:12px">Leave off first. Turn on if snapshots look solid in SDx until you touch the opacity slider there. Baked images look right immediately, but SDx's opacity slider then shows 100% and stacks on top of the baked value.</div></div>` : ""}
             <div class="step ${curStep === 3 ? "cur" : ""}"><h4>3. Import</h4>
+                <div class="chk fail glow" id="sdxbmNoSel" style="margin-bottom:8px;${noSel ? "" : "display:none"}"><b>No comments are selected.</b> Go back to step 1 and tick at least one author in the list, or click Select all.</div>
                 <div class="row"><button type="button" class="b p" id="sdxbmImport" ${p && !blocked && (state.layers.length || canCreate) ? "" : "disabled"}>Import into SDx layer</button>
                 <button type="button" class="b" id="sdxbmDownload" ${state.converted ? "" : "disabled"}>Download XFDF (debug)</button></div>
                 <div class="row" style="margin-top:8px"><button type="button" class="b" id="sdxbmUndo" ${state.layers.length ? "" : "disabled"} title="Remove the comments added by the most recent import into the selected layer">Undo last import</button>
@@ -2570,8 +2576,14 @@
                 <button type="button" class="b" id="sdxbmDump" title="Download the raw markup of every layer on this document (for troubleshooting)">Dump all layers (debug)</button>
                 <button type="button" class="b" id="sdxbmEmpty" title="Delete every comment in a layer you choose, including other people's">Empty a layer...</button></div></div>`;
         const drop = document.getElementById("sdxbmDrop");
-        document.querySelectorAll(".sdxbmAuthor").forEach(cb => cb.addEventListener("change", () => { state.authorSel = selectedAuthors(); }));
-        const setAllAuthors = on => { document.querySelectorAll(".sdxbmAuthor").forEach(cb => { cb.checked = on; }); state.authorSel = selectedAuthors(); };
+        const refreshNoSel = () => { const el = document.getElementById("sdxbmNoSel"); if (el) el.style.display = state.parsed && !state.authorSel.size ? "" : "none"; };
+        document.querySelectorAll(".sdxbmAuthor").forEach(cb => cb.addEventListener("change", () => { state.authorSel = selectedAuthors(); refreshNoSel(); }));
+        const setAllAuthors = on => { document.querySelectorAll(".sdxbmAuthor").forEach(cb => { cb.checked = on; }); state.authorSel = selectedAuthors(); refreshNoSel(); };
+        document.getElementById("sdxbmMakeNew")?.addEventListener("click", () => { state.layerChoice = "__new__"; state.layerTouched = true; render(); });
+        document.getElementById("sdxbmUseExisting")?.addEventListener("click", () => {
+            state.layerChoice = state.layers.some(l => l.id === state.lastMarkupOBID) ? state.lastMarkupOBID : (state.layers[0] && state.layers[0].id) || "";
+            state.layerTouched = true; render();
+        });
         document.getElementById("sdxbmSelAll")?.addEventListener("click", () => setAllAuthors(true));
         document.getElementById("sdxbmSelNone")?.addEventListener("click", () => setAllAuthors(false));
         const fileInput = document.getElementById("sdxbmFile");
