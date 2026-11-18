@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.4.2
+// @version      1.5.0
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.4.2";
+    const VERSION = "1.5.0";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -774,7 +774,9 @@
                 let a;
                 try { a = pdfToJs(ctx, dict); } catch { continue; }
                 if (!a || a.Subtype === "Popup" || a.Subtype === "Link" || a.Subtype === "Widget") continue;
-                if (typeof a.NM === "string" && a.NM.startsWith("sdx-ex-")) { existingSkipped++; continue; }
+                // Comments copied out of SDx at export time are kept, listed as "[SDx] author" and unchecked by default.
+                const embedded = typeof a.NM === "string" && a.NM.startsWith("sdx-ex-");
+                if (embedded) { existingSkipped++; a.F = (Number(a.F) || 0) & ~128; }
                 let parentNM = null;
                 try {
                     const irt = dict.lookupMaybe(P.PDFName.of("IRT"), P.PDFDict);
@@ -819,8 +821,8 @@
                         }
                     } catch {}
                 }
-                items.push({ page: pageIdx, index: i, a, parentNM, ap });
-                const who = a.T || "(no author)";
+                items.push({ page: pageIdx, index: i, a, parentNM, ap, embedded });
+                const who = authorKey({ a, embedded });
                 authors.set(who, (authors.get(who) || 0) + 1);
             }
         });
@@ -1745,7 +1747,7 @@
 
     async function runImport(layerId, selectedAuthors, opts) {
         const me = await loadMe();
-        let items = state.parsed.items.filter(it => selectedAuthors.has(it.a.T || "(no author)"));
+        let items = state.parsed.items.filter(it => selectedAuthors.has(authorKey(it)));
         const sdxCount = state.sdxPages && state.sdxPages.file === state.fileOBID && state.sdxPages.sizes ? state.sdxPages.sizes.length : 0;
         const outOfRange = sdxCount ? items.filter(it => it.page >= sdxCount) : [];
         if (outOfRange.length) items = items.filter(it => it.page < sdxCount);
@@ -2521,12 +2523,14 @@
         let preview = "";
         if (p) {
             const authorRows = Array.from(p.authors.entries()).map(([who, n]) =>
-                `<tr><td><input type="checkbox" class="sdxbmAuthor" data-a="${esc(who)}" checked></td><td>${esc(who)}</td><td>${n}</td></tr>`).join("");
+                `<tr><td><input type="checkbox" class="sdxbmAuthor" data-a="${esc(who)}" ${(state.authorSel ? state.authorSel.has(who) : !who.startsWith("[SDx] ")) ? "checked" : ""}></td><td>${esc(who)}</td><td>${n}</td></tr>`).join("");
             preview = `
-                <div class="ok">Read <b>${p.items.length}</b> annotation(s) on ${p.pageCount} page(s) from <b>${esc(p.fileName)}</b>.${p.existingSkipped ? ` ${p.existingSkipped} existing SDx comment(s) embedded at export were ignored.` : ""}
+                <div class="ok">Read <b>${p.items.length}</b> annotation(s) on ${p.pageCount} page(s) from <b>${esc(p.fileName)}</b>.${p.existingSkipped ? ` ${p.existingSkipped} of them are existing SDx comments embedded at export. They are listed as "[SDx] name" and are not selected by default.` : ""}
                     ${state.converted ? `Convertible: <b>${state.converted.items.length}</b>, not supported: <b>${state.converted.skipped.length}</b>.` : ""}</div>
                 ${checkHtml}
-                <table style="margin-top:8px"><tr><th></th><th>Bluebeam author</th><th>Annotations</th></tr>${authorRows}</table>
+                <div class="row" style="margin-top:8px"><b style="font-size:12px">Import comments by:</b>
+                    <button type="button" class="b" id="sdxbmSelAll">Select all</button><button type="button" class="b" id="sdxbmSelNone">Select none</button></div>
+                <table style="margin-top:6px"><tr><th></th><th>Author</th><th>Annotations</th></tr>${authorRows}</table>
                 ${state.converted && state.converted.skipped.length ? `<div class="note" style="margin-top:8px"><b>Skipped:</b> ${esc(Array.from(new Set(state.converted.skipped.map(s => `${s.type} (${s.reason})`))).join("; "))}</div>` : ""}`;
         }
         body.innerHTML = `
@@ -2566,6 +2570,10 @@
                 <button type="button" class="b" id="sdxbmDump" title="Download the raw markup of every layer on this document (for troubleshooting)">Dump all layers (debug)</button>
                 <button type="button" class="b" id="sdxbmEmpty" title="Delete every comment in a layer you choose, including other people's">Empty a layer...</button></div></div>`;
         const drop = document.getElementById("sdxbmDrop");
+        document.querySelectorAll(".sdxbmAuthor").forEach(cb => cb.addEventListener("change", () => { state.authorSel = selectedAuthors(); }));
+        const setAllAuthors = on => { document.querySelectorAll(".sdxbmAuthor").forEach(cb => { cb.checked = on; }); state.authorSel = selectedAuthors(); };
+        document.getElementById("sdxbmSelAll")?.addEventListener("click", () => setAllAuthors(true));
+        document.getElementById("sdxbmSelNone")?.addEventListener("click", () => setAllAuthors(false));
         const fileInput = document.getElementById("sdxbmFile");
         fileInput.addEventListener("change", () => handleFile(fileInput.files && fileInput.files[0]));
         drop.addEventListener("click", () => fileInput.click());
@@ -2626,6 +2634,10 @@
             render();
         });
     }
+    // Comments embedded from SDx are grouped under "[SDx] name" so they can be chosen separately from Bluebeam authors.
+    function authorKey(it) {
+        return (it.embedded ? "[SDx] " : "") + ((it.a && it.a.T) || "(no author)");
+    }
     function selectedAuthors() {
         const set = new Set();
         document.querySelectorAll(".sdxbmAuthor").forEach(cb => { if (cb.checked) set.add(cb.dataset.a); });
@@ -2649,6 +2661,7 @@
             parsed.fileName = file.name;
             parsed.bytes = buf;
             state.parsed = parsed;
+            state.authorSel = null;
             state.check = null;
             state.checkAck = false;
             state.layerTouched = false;
