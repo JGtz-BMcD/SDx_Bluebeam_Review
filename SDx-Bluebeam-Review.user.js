@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/JGtz-BMcD/SDx_Bluebeam_Review/issues
 // @downloadURL  https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
 // @updateURL    https://raw.githubusercontent.com/JGtz-BMcD/SDx_Bluebeam_Review/main/SDx-Bluebeam-Review.user.js
-// @version      1.5.1
+// @version      1.5.5
 // @description  Import markups made in Bluebeam Revu (standard PDF annotations, incl. snapshots/stamps) into your own SDx markup layer on the document you are viewing, with author/date/subject metadata tracked. Drag and drop the PDF into the popup, or use Export to Bluebeam to copy the SDx PDF to a working folder and import it back after saving.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.5.1";
+    const VERSION = "1.5.5";
     const TOOL = "Bluebeam Review";
     const ICON = "\u{1F4D0}";
     const IDS = { style: "sdxbm_style", btn: "sdxbm_btn", modal: "sdxbm_modal", backdrop: "sdxbm_backdrop" };
@@ -1952,24 +1952,34 @@
     // When SDx runs embedded in another site, the browser blocks the folder picker and permission prompt in
     // the page itself. A small pop-up window is a top-level window, where they ARE allowed; the chosen folder
     // handle is handed back to this page (same origin), which then reads and writes it as usual.
+    function isEmbedded() {
+        try { return window.self !== window.top; } catch { return true; }
+    }
+    function withTimeout(promise, ms, what) {
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error(`${what || "The browser"} did not respond (timed out)`)), ms);
+            promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+        });
+    }
     function connectFolderViaPopup(forcePick) {
         return new Promise((resolve, reject) => {
             const pw = window.open("", "sdxbm_folder", "popup=yes,width=560,height=380");
             if (!pw) { reject(new Error("The browser blocked the folder window. Allow pop-ups for this site and try again.")); return; }
             let done = false;
+            const closedTimer = setInterval(() => { if (pw.closed) { clearInterval(closedTimer); if (!done) { done = true; reject(new Error("The folder window was closed.")); } } }, 500);
             // A folder handle belongs to the window that created it and stops working when that window closes.
             // So the pop-up stays open (it can be minimized) and the page uses its handle directly.
             const finish = h => {
-                done = true;
+                done = true; clearInterval(closedTimer);
                 state.work.agentWin = pw;
-                try { d2.getElementById("m").textContent = `Connected to "${h.name}". Keep this small window open (minimize it) while you review. The Bluebeam Review tool uses it to save files and watch for your saves. You can close it when you are done.`; d2.getElementById("use").style.display = "none"; d2.getElementById("pick").style.display = "none"; } catch {}
+                try { d2.getElementById("m").textContent = `Connected to "${h.name}". Keep this small window open (minimize it) while you review. The Bluebeam Review tool uses it to save files and watch for your saves. You can close it when you are done.`; d2.getElementById("use").style.display = "none"; d2.getElementById("pick").style.display = "none"; d2.getElementById("hint").style.display = "none"; } catch {}
                 try { pw.blur(); window.focus(); } catch {}
                 resolve(h);
             };
             const d = pw.document; const d2 = d;
             d.open(); d.write("<!doctype html><html><head><meta charset='utf-8'><title>SDx Bluebeam Review - folder access</title></head><body></body></html>"); d.close();
             d.body.style.cssText = "font:14px 'Segoe UI',Arial,sans-serif;padding:20px;color:#1b2b3a";
-            d.body.innerHTML = '<h3 style="margin-top:0">Working folder access</h3><p id="m">Looking for the saved folder...</p><div><button id="use" style="display:none;padding:8px 14px;margin-right:8px">Use saved folder</button><button id="pick" style="padding:8px 14px">Choose folder...</button></div>';
+            d.body.innerHTML = '<h3 style="margin-top:0">Working folder access</h3><p id="m">Looking for the saved folder...</p><div><button id="use" style="display:none;padding:8px 14px;margin-right:8px">Use saved folder</button><button id="pick" style="padding:8px 14px">Choose folder...</button></div><p id="hint" style="margin-top:16px;padding:10px 12px;background:#fff4ce;border:1px solid #ffb900;border-radius:6px;font-size:13px"><b>Tip:</b> if &quot;Use saved folder&quot; hangs, shows an error, or nothing happens after a few seconds, click <b>Choose folder...</b> and pick your working folder again. Then click <b>Use saved folder</b> if it is still offered.</p>';
             const m = d.getElementById("m"), use = d.getElementById("use"), pick = d.getElementById("pick");
             let saved = null;
             pw.addEventListener("beforeunload", () => { if (!done) reject(new Error("The folder window was closed.")); });
@@ -1978,21 +1988,32 @@
                 if (saved) { m.textContent = `Saved folder: "${saved.name}". Click to allow access again, or choose another folder.`; use.style.display = ""; }
                 else m.textContent = "Choose the working folder for exported PDFs. This window is needed because SDx is embedded in another site, which blocks folder access inside the page itself.";
             })();
+            // Picking a folder in the system dialog also grants access, so it needs no separate permission prompt.
+            const doPick = async startIn => {
+                try {
+                    const h = await pw.showDirectoryPicker({ id: "sdxbm-work", mode: "readwrite", startIn: startIn || "documents" });
+                    try { await withTimeout(idbSet("workDir", h, pw.indexedDB), 1500, "Saving the folder"); } catch {}
+                    try { await withTimeout(idbSet("workDir", h), 1500, "Saving the folder"); } catch {}
+                    finish(h);
+                } catch (e) {
+                    if (e && e.name === "AbortError") { m.textContent = "No folder chosen. Click 'Choose folder...' to pick your working folder."; return; }
+                    m.textContent = "Could not use that folder: " + (e && e.message ? e.message : e) + " Click 'Choose folder...' to try again.";
+                }
+            };
             use.onclick = async () => {
                 try {
-                    const p = await saved.requestPermission({ mode: "readwrite" });
-                    if (p === "granted") { try { await idbSet("workDir", saved); } catch {} finish(saved); }
-                    else m.textContent = "Permission was not granted. Try again or choose another folder.";
-                } catch (e) { m.textContent = "Could not use it: " + e.message; }
+                    m.textContent = "Requesting access... if nothing happens, click 'Choose folder...' below and pick your working folder again.";
+                    let p = await saved.queryPermission({ mode: "readwrite" });
+                    if (p !== "granted") p = await withTimeout(saved.requestPermission({ mode: "readwrite" }), 3500, "The permission prompt");
+                    if (p !== "granted") throw new Error("Permission was not granted.");
+                    try { await withTimeout(idbSet("workDir", saved), 1500, "Saving the folder"); } catch {}
+                    finish(saved);
+                } catch (e) {
+                    m.textContent = "The browser could not show its permission prompt for the saved folder, so the folder picker is opening instead. Choose the same folder and click 'Select Folder'.";
+                    await doPick(saved);
+                }
             };
-            pick.onclick = async () => {
-                try {
-                    const h = await pw.showDirectoryPicker({ id: "sdxbm-work", mode: "readwrite", startIn: "documents" });
-                    try { await idbSet("workDir", h, pw.indexedDB); } catch {}
-                    try { await idbSet("workDir", h); } catch {}
-                    finish(h);
-                } catch (e) { if (e && e.name !== "AbortError") m.textContent = "Could not use that folder: " + e.message; }
-            };
+            pick.onclick = () => doPick(saved || null);
         });
     }
     function downloadBytes(bytes, name) {
@@ -2079,24 +2100,34 @@
         if (state.busy) return;
         if (!w.dir && !w.blocked) { setStatus("Choose a working folder first.", true); return; }
         state.busy = true;
+        setStatus("Starting the export...");
         try {
             if (w.dirViaPopup && (!w.agentWin || w.agentWin.closed)) { w.dir = null; w.dirViaPopup = false; w.blocked = true; }
             let useDir = Boolean(w.dir) && !w.blocked;
+            // Browsers only allow a pop-up right after a click, so when this page is embedded (folder access is
+            // refused there) open the folder window immediately instead of waiting for the direct attempt to fail.
+            let popupPromise = null;
+            if (!(useDir && w.dirViaPopup) && (isEmbedded() || w.blocked)) {
+                setStatus("Opening the folder window...");
+                popupPromise = connectFolderViaPopup(false);
+                popupPromise.catch(() => {});
+                useDir = false;
+            }
             if (useDir && w.dirViaPopup) {
                 // handle from the open pop-up window: already authorised there
             } else if (useDir) {
                 try {
-                    if (!(await ensureReadWrite(w.dir))) throw new Error("Folder access was not granted.");
+                    if (!(await withTimeout(ensureReadWrite(w.dir), 2500, "The folder permission request"))) throw new Error("Folder access was not granted.");
                 } catch (e) {
-                    if (!isBlockedErr(e)) throw e;
+                    if (!isBlockedErr(e) && !/timed out/i.test(e.message)) throw e;
                     warn("Folder access blocked in this page, trying the folder window:", e);
                     w.blocked = true; useDir = false;
                 }
             }
             if (!useDir) {
                 try {
-                    setStatus("Opening the folder window...");
-                    const h = await connectFolderViaPopup(false);
+                    setStatus("Waiting for the folder window - pick or confirm the folder there...");
+                    const h = await (popupPromise || connectFolderViaPopup(false));
                     w.dir = h; w.dirName = h.name; w.blocked = false; w.dirViaPopup = true; useDir = true;
                 } catch (pe) {
                     warn("Folder window failed:", pe);
